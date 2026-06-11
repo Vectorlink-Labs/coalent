@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="Coalent">
+  <defs>
+    <linearGradient id="fav" x1="8" y1="8" x2="40" y2="40" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#818CF8"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+  <!-- dark rounded tile so the mark pops in any browser tab -->
+  <rect width="48" height="48" rx="11" fill="#0B1020"/>
+  <!-- simplified for tiny sizes: C ring + focal core, no arc nodes -->
+  <path d="M34 14.5 A14 14 0 1 0 34 33.5" fill="none" stroke="url(#fav)"
+        stroke-width="5.5" stroke-linecap="round"/>
+  <circle cx="24" cy="24" r="5.4" fill="url(#fav)"/>
+  <circle cx="24" cy="24" r="2.1" fill="#ECFEFF"/>
+</svg>

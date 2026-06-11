@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Internal — NOT for publication (audits, planning, design, commercial strategy).
+# NOTE: this only keeps them out of a *fresh* repo. The existing repo's history
+# already contains them — publish from a clean repo (see RELEASING notes).
+/ARCHITECTURE_REVIEW.md
+/REMEDIATION_PLAN.md
+/INTELLIGENCE_CORE_CONTRACT.md
+/PHASE1_PLAN.md
+/OPEN_CORE.md
+/cognitive-cache-design.html
+# Review before publishing — likely internal:
+/RELEASING.md
+/brand/showcase.html

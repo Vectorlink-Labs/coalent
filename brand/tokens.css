@@ -1,0 +1,25 @@
+/* Coalent brand tokens — drop into the product site / docs / app. */
+:root {
+  /* color */
+  --cog-ink: #0B1020;
+  --cog-indigo: #6366F1;        /* primary brand */
+  --cog-indigo-deep: #4F46E5;   /* hover / active / depth */
+  --cog-indigo-soft: #818CF8;   /* indigo on dark surfaces */
+  --cog-cyan: #22D3EE;          /* freshness / live accent */
+  --cog-mint: #2DD4BF;          /* secondary accent */
+  --cog-paper: #FBFCFE;         /* light surface */
+  --cog-slate: #475569;         /* secondary text */
+  --cog-line: #E6E9F0;          /* borders */
+
+  /* signature gradient: depth -> clarity, source -> understanding, stale -> fresh */
+  --cog-gradient: linear-gradient(90deg, #6366F1, #22D3EE);
+  --cog-gradient-diag: linear-gradient(135deg, #6366F1, #22D3EE);
+  --cog-gradient-dark: linear-gradient(90deg, #818CF8, #22D3EE);
+
+  /* type */
+  --cog-font-sans: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --cog-font-mono: ui-monospace, Consolas, "Liberation Mono", monospace;
+
+  /* shape */
+  --cog-radius: 14px;
+}
