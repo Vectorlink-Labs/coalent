@@ -41,10 +41,10 @@ coalent = "coalent.cli:main"
 
 [project.urls]
 # TODO before publishing: replace `your-org` with your real GitHub org/username.
-Homepage = "https://github.com/your-org/coalent"
-Repository = "https://github.com/your-org/coalent"
-Documentation = "https://github.com/your-org/coalent#readme"
-Issues = "https://github.com/your-org/coalent/issues"
+Homepage = "https://github.com/Vectorlink-Labs/coalent"
+Repository = "https://github.com/Vectorlink-Labs/coalent"
+Documentation = "https://github.com/Vectorlink-Labs/coalent#readme"
+Issues = "https://github.com/Vectorlink-Labs/coalent/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/coalent"]
