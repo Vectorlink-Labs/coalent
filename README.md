@@ -1,8 +1,5 @@
-<!-- After you create the GitHub repo, swap the logo src below to the absolute raw URL
-     (https://raw.githubusercontent.com/<you>/coalent/main/brand/wordmark.svg) so it
-     renders on PyPI too. Relative paths only render on GitHub. -->
 <p align="center">
-  <img src="brand/wordmark.svg" alt="Coalent" width="300">
+  <img src="https://raw.githubusercontent.com/Vectorlink-Labs/coalent/main/brand/wordmark.png" alt="Coalent" width="320">
 </p>
 
 <p align="center">
@@ -173,7 +170,7 @@ $ coalent stats
 
 ## Documentation
 
-📚 **Full docs:** `https://YOUR-DOCS-URL` — concepts, provenance & freshness, retrievers, synthesizers, persistence, worked examples (vector search, MCP & tools, agents), and the complete `get()` / data-model reference.
+📚 **Full docs: [coalent.ai/docs](https://coalent.ai/docs)** — concepts, provenance & freshness, retrievers, synthesizers, persistence, worked examples (vector search, MCP & tools, agents), and the complete `get()` / data-model reference.
 
 ## Install options
 

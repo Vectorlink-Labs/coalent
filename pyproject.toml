@@ -40,7 +40,6 @@ dev = ["pytest>=7.0", "pytest-cov", "mypy>=1.8", "ruff>=0.4"]
 coalent = "coalent.cli:main"
 
 [project.urls]
-# TODO before publishing: replace `your-org` with your real GitHub org/username.
 Homepage = "https://github.com/Vectorlink-Labs/coalent"
 Repository = "https://github.com/Vectorlink-Labs/coalent"
 Documentation = "https://github.com/Vectorlink-Labs/coalent#readme"
