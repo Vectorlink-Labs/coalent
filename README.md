@@ -16,6 +16,10 @@
 </p>
 
 <p align="center">
+  <b>📖 <a href="https://coalent.ai/docs">Documentation</a></b> &nbsp;·&nbsp; <a href="https://coalent.ai">coalent.ai</a>
+</p>
+
+<p align="center">
   <a href="#quickstart">Quickstart</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#bring-your-own-stack">Bring your own stack</a> ·
