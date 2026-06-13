@@ -143,15 +143,15 @@ tools = build_mcp_tools(cache)        # expose the cache as an MCP tool
 
 ## Benchmark
 
-The same query + source-change workload across three systems, scored by an independent oracle (reproduce it with `coalent.evaluation.harness.run_benchmark`):
+A real-LLM, quality-first benchmark (gpt-4o-mini, graded by an independent gpt-4o judge) on number-dense documents — answering from Coalent's *understanding* vs the full raw context, with a source change midway:
 
-| System | Accuracy | Stale answers | Token cost |
+| System | Accuracy | Stays fresh | Context tokens / read |
 |---|:---:|:---:|:---:|
-| Always re-read (naive RAG) | 100% | 0% | 70 |
-| Cached, no invalidation | 80% | **20%** | 35 |
-| **Coalent** | **100%** | **0%** | **49** |
+| Full-context RAG | 100% | ✓ | 283 |
+| Normal cache (raw chunks) | 86% | ✗ stale | 283 |
+| **Coalent** | **100%** | **✓** | **96** |
 
-As correct as re-reading everything, **~30% cheaper**, with **zero stale answers** — and a change to an *unrelated* source causes no staleness, by construction (provenance precision).
+Coalent **matches full-context RAG accuracy** (independently graded), **never goes stale** after a source change (a normal cache does), and sends **~66% fewer context tokens — up to 75% on large documents.** Cost optimization without trading away quality. *(gpt-4o corroborates within ~3%; full two-model breakdown in the [docs](https://coalent.ai/docs/benchmark).)*
 
 ## CLI
 
