@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..domain.models import ChangeEvent, ProvenanceManifest, SourceSpan
-from .embedding import Embedder, HashingEmbedder, cosine, tokenize
+from .embedding import Embedder, cosine, default_embedder, tokenize
 from .ports import Chunk, Retriever, Synthesizer
 from .store import CognitionStore
 from .unit import Cognition
@@ -106,7 +106,7 @@ class SemanticCache:
     ) -> None:
         self._retriever = retriever
         self._synth = synthesizer
-        self._embedder: Embedder = embedder if embedder is not None else HashingEmbedder()
+        self._embedder: Embedder = embedder if embedder is not None else default_embedder()
         self._threshold = hit_threshold
         self._coverage_floor = coverage_floor
         self._strategy = strategy

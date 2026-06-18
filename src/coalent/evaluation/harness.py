@@ -110,7 +110,9 @@ class _Semantic:
 
     def __init__(self, corpus: dict[str, str], *, invalidates: bool) -> None:
         # coverage_floor=0 isolates the variable under test to invalidation alone.
-        self._cache = SemanticCache(CorpusRetriever(corpus), StubSynthesizer(), coverage_floor=0.0)
+        self._cache = SemanticCache(
+            CorpusRetriever(corpus), StubSynthesizer(), embedder=HashingEmbedder(), coverage_floor=0.0
+        )
         self._invalidates = invalidates
 
     def serve(self, query: str) -> tuple[str, int]:

@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.1]
+
+### Added
+- **`OpenAIEmbedder`** — real semantic embeddings via the OpenAI Embeddings API (extra `coalent[openai]`); bring your own client or let it read `OPENAI_API_KEY`. Defaults to `text-embedding-3-small` (`text-embedding-3-large` for max accuracy).
+- **`FunctionEmbedder`** — wrap any `text -> sequence[float]` callable (e.g. a local sentence-transformers model) as an `Embedder`.
+
+### Changed
+- **Smart default embedder.** When no `embedder` is passed, `SemanticCache` now auto-uses `OpenAIEmbedder` if the `openai` package is installed and `OPENAI_API_KEY` is set — accurate, semantic cache matching out of the box. Otherwise it falls back to the lexical `HashingEmbedder` **and emits a warning** (keyword-overlap matching can miss semantically-similar queries). Always overridable with `embedder=`.
+
 ## [0.2.0]
 
 First public release — a real-time, provenance-invalidated cognitive cache for AI

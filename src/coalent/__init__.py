@@ -30,6 +30,7 @@ from .semantic import (
     ContextStrategy,
     Embedder,
     FreshnessPolicy,
+    FunctionEmbedder,
     FunctionRetriever,
     HashingEmbedder,
     InMemoryCognitionStore,
@@ -38,6 +39,7 @@ from .semantic import (
     JSONPassthroughSynthesizer,
     LLMProvider,
     LLMSynthesizer,
+    OpenAIEmbedder,
     PgVectorRetriever,
     QdrantRetriever,
     RedisCognitionStore,
@@ -67,7 +69,7 @@ from .events import (
     verify_github_signature,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "__version__",
@@ -88,6 +90,8 @@ __all__ = [
     "JSONPassthroughSynthesizer",
     "Embedder",
     "HashingEmbedder",
+    "OpenAIEmbedder",
+    "FunctionEmbedder",
     "cosine",
     "InMemoryRetriever",
     "FunctionRetriever",

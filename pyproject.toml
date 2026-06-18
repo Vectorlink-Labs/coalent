@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "coalent"
-version = "0.2.0"
+version = "0.2.1"
 description = "A real-time, provenance-invalidated cognitive cache layer for AI agents and RAG."
 readme = "README.md"
 requires-python = ">=3.10"

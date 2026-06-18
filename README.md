@@ -127,6 +127,17 @@ retriever = QdrantRetriever(client=my_client, collection="docs", embed=my_embed)
 - `LLMSynthesizer` — structured, citation-grounded understanding via your LLM (OpenAI, Anthropic, or any provider). You own the `instruction` and `fields`; Coalent owns the source / strict-JSON / citation envelope, so provenance is captured no matter what you ask for.
 - `JSONPassthroughSynthesizer` — for already-structured tool/API JSON: caches it *as* the understanding, **no LLM call**.
 
+**Embeddings** — how the cache matches queries by *meaning*. With `coalent[openai]` installed and `OPENAI_API_KEY` set, the cache uses OpenAI embeddings **automatically**; otherwise it warns and falls back to a lexical matcher. Override anytime:
+
+```python
+from coalent import SemanticCache, OpenAIEmbedder, FunctionEmbedder
+
+cache = SemanticCache(retriever, synthesizer, embedder=OpenAIEmbedder("text-embedding-3-large"))
+# or a local model: embedder=FunctionEmbedder(lambda t: my_model.encode(t).tolist())
+```
+
+> Use a real embedder for semantic matching — the no-key `HashingEmbedder` fallback matches on keyword overlap, not meaning, so similar-but-differently-worded queries can miss the cache.
+
 **Stores** — durable and restart-safe (the invalidation graph rebuilds on startup):
 
 ```python

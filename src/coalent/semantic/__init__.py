@@ -13,7 +13,7 @@ from .cache import (
     Result,
     SemanticCache,
 )
-from .embedding import Embedder, HashingEmbedder, cosine
+from .embedding import Embedder, FunctionEmbedder, HashingEmbedder, OpenAIEmbedder, cosine
 from .memory import (
     BaseVectorRetriever,
     CompositeRetriever,
@@ -49,6 +49,8 @@ __all__ = [
     "JSONPassthroughSynthesizer",
     "Embedder",
     "HashingEmbedder",
+    "OpenAIEmbedder",
+    "FunctionEmbedder",
     "cosine",
     "InMemoryRetriever",
     "FunctionRetriever",
