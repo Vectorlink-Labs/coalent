@@ -51,7 +51,10 @@ from .semantic import (
     StubSynthesizer,
     Synthesis,
     Synthesizer,
+    calibrate_thresholds,
     cosine,
+    default_thresholds_for,
+    suggest_thresholds,
 )
 
 # --- Shared primitives (provenance + change events) ---
@@ -69,7 +72,7 @@ from .events import (
     verify_github_signature,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
@@ -93,6 +96,9 @@ __all__ = [
     "OpenAIEmbedder",
     "FunctionEmbedder",
     "cosine",
+    "default_thresholds_for",
+    "calibrate_thresholds",
+    "suggest_thresholds",
     "InMemoryRetriever",
     "FunctionRetriever",
     "CompositeRetriever",

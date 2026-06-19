@@ -85,6 +85,14 @@ class OpenAIEmbedder:
         response = self._client.embeddings.create(model=self._model, input=text)
         return list(response.data[0].embedding)
 
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        """One batched API call for all texts — the v0.3 cost lever for per-claim
+        embedding (K claims in a single round-trip instead of K)."""
+        if not texts:
+            return []
+        response = self._client.embeddings.create(model=self._model, input=texts)
+        return [list(item.embedding) for item in response.data]
+
 
 class FunctionEmbedder:
     """Wrap any ``text -> sequence[float]`` callable as an Embedder.
@@ -96,11 +104,25 @@ class FunctionEmbedder:
         embedder = FunctionEmbedder(lambda t: m.encode(t).tolist())
     """
 
-    def __init__(self, fn: Callable[[str], "Sequence[float]"]) -> None:
+    def __init__(
+        self,
+        fn: Callable[[str], "Sequence[float]"],
+        *,
+        batch: "Callable[[list[str]], Sequence[Sequence[float]]] | None" = None,
+    ) -> None:
         self._fn = fn
+        self._batch = batch
 
     def embed(self, text: str) -> list[float]:
         return list(self._fn(text))
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        """Batched path for local models (e.g. sentence-transformers'
+        ``model.encode(list)``, far faster than per-string). Pass ``batch=`` to
+        enable; otherwise loops ``embed``."""
+        if self._batch is not None:
+            return [list(v) for v in self._batch(texts)]
+        return [list(self._fn(t)) for t in texts]
 
 
 def default_embedder() -> "Embedder":
@@ -138,3 +160,30 @@ def cosine(a: Sequence[float], b: Sequence[float]) -> float:
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
     return dot / (na * nb) if na and nb else 0.0
+
+
+def embed_texts(embedder: Embedder, texts: list[str]) -> list[list[float]]:
+    """Embed many texts, using the embedder's batched ``embed_many`` if it has one
+    (one round-trip), else looping ``embed``. Keeps the one-method ``Embedder``
+    contract intact while letting batch-capable embedders save calls."""
+    if not texts:
+        return []
+    batch = getattr(embedder, "embed_many", None)
+    if callable(batch):
+        return [list(v) for v in batch(texts)]
+    return [embedder.embed(t) for t in texts]
+
+
+def default_thresholds_for(embedder: Embedder) -> tuple[float, float]:
+    """Sensible ``(hit_threshold, coverage_floor)`` for the SHIPPED embedders.
+
+    Cosine distributions differ a lot by embedder: OpenAI ``text-embedding-3`` cosines
+    are compressed (paraphrases land ~0.35-0.55), while the lexical ``HashingEmbedder``
+    scores word-overlap higher and sparser — so one fixed default can't fit both, and a
+    too-high default makes real (e.g. OpenAI) matches silently miss. For a custom/unknown
+    embedder we return a neutral middle; tune it with ``coalent.calibrate_thresholds``."""
+    if isinstance(embedder, OpenAIEmbedder):
+        return (0.33, 0.28)
+    if isinstance(embedder, HashingEmbedder):
+        return (0.6, 0.5)
+    return (0.45, 0.4)

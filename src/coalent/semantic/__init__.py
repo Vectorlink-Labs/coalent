@@ -13,7 +13,15 @@ from .cache import (
     Result,
     SemanticCache,
 )
-from .embedding import Embedder, FunctionEmbedder, HashingEmbedder, OpenAIEmbedder, cosine
+from .calibrate import calibrate_thresholds, suggest_thresholds
+from .embedding import (
+    Embedder,
+    FunctionEmbedder,
+    HashingEmbedder,
+    OpenAIEmbedder,
+    cosine,
+    default_thresholds_for,
+)
 from .memory import (
     BaseVectorRetriever,
     CompositeRetriever,
@@ -52,6 +60,9 @@ __all__ = [
     "OpenAIEmbedder",
     "FunctionEmbedder",
     "cosine",
+    "default_thresholds_for",
+    "calibrate_thresholds",
+    "suggest_thresholds",
     "InMemoryRetriever",
     "FunctionRetriever",
     "CompositeRetriever",

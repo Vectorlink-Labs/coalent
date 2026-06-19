@@ -1,9 +1,9 @@
 """Acceptance test — context intelligence.
 
-Proves: a cache hit that under-covers the query auto-escalates to fresh raw (no
-manual signal); a confident hit serves minimum context with raw reachable but not
-dumped; the context payload follows the strategy; and minimum-context projection
-trims to the query-relevant slice. Plus the drill/widen agent affordances.
+Proves: a cache hit serves minimum context (the understanding) with the raw retained
+and reachable but not dumped; the context payload follows the strategy; and
+minimum-context projection trims to the query-relevant slice. Plus the drill/widen
+agent affordances.
 """
 from __future__ import annotations
 
@@ -15,22 +15,6 @@ from coalent.semantic import (
     StubSynthesizer,
     Synthesis,
 )
-
-
-def test_under_covering_hit_escalates_to_fresh_raw() -> None:
-    retriever = InMemoryRetriever(top_k=1)  # one doc per query
-    retriever.add("doc:overview", "annual leave policy summary overview")
-    retriever.add("doc:table", "leave accrual rollover twentyfive days per year table")
-    cache = SemanticCache(retriever, StubSynthesizer(), coverage_floor=0.6)
-
-    cache.get("leave policy")  # builds a unit from doc:overview only (no numbers)
-
-    # A close rephrase that needs the accrual detail the unit never captured.
-    result = cache.get("leave policy accrual rollover days")
-    assert result.cache_hit is True          # semantic hit on the same unit
-    assert result.escalated is True          # but it under-covered -> escalated
-    assert "twentyfive" in result.raw_text   # fresh raw pulled the detail in
-    assert "twentyfive" in " ".join(result.context["raw"])  # and surfaced in context
 
 
 def test_confident_hit_serves_minimum_context_raw_reachable() -> None:

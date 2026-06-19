@@ -24,18 +24,43 @@ _SYSTEM = (
     "prose, no markdown, no code fences."
 )
 
-#: User-owned (overridable). What understanding to produce.
+#: User-owned (overridable). What understanding to produce. Query-INDEPENDENT and
+#: comprehensive by design: the understanding is cached and reused across DIFFERENT
+#: future questions about the same sources, so it must capture the whole source's key
+#: points — not just what answers the question that happened to build it.
 _DEFAULT_INSTRUCTION = (
-    "Produce a faithful, decision-ready understanding of the question: a concise "
-    "summary of what actually matters for a decision, the key claims (each grounded "
-    "in a source), the salient entities, and the concrete facts (names, numbers, "
-    "dates, statuses). Be specific and tight — no padding."
+    "Produce a faithful, REUSABLE understanding of the provided sources — independent "
+    "of any single question, because it is cached and reused to answer other questions "
+    "about the same material. Cover the sources' key points comprehensively: a summary "
+    "of what matters, the key claims (each grounded in a source), the salient entities, "
+    "and the concrete facts (names, numbers, dates, amounts, conditions, fees, and "
+    "exceptions). Capture every detail a later question might reasonably ask about; be "
+    "comprehensive about the sources but tight in wording — no padding, never invent."
 )
 
 #: An instruction is either a fixed string or computed per query.
 InstructionFn = Callable[[str], str]
 
 _DEFAULT_FIELDS = ["summary", "claims", "entities", "facts"]
+
+
+def _depth_directive(depth: float) -> str:
+    """Map the 0-1 depth knob to an instruction suffix. Deeper = preserve every detail
+    (fewer downstream coverage gaps, higher token cost); terser = cheaper, more gaps —
+    the dial trades cost against completeness, and the cache's escalation rate is the
+    feedback signal for tuning it."""
+    if depth <= 0.34:
+        return (
+            " Keep it TERSE: only the headline facts a decision needs — omit minor "
+            "details, edge cases, and secondary qualifiers."
+        )
+    if depth >= 0.67:
+        return (
+            " Be EXHAUSTIVE: preserve every number, time window, condition, fee, "
+            "exception, edge case, and qualifier the sources state — drop nothing a "
+            "later question might ask about."
+        )
+    return ""  # mid: the default instruction's balance
 
 
 def _build_prompt(query: str, chunks: list[Chunk], instruction: str, fields: list[str]) -> str:
@@ -98,6 +123,7 @@ class LLMSynthesizer:
         retries: int = 1,
         instruction: str | InstructionFn = _DEFAULT_INSTRUCTION,
         fields: list[str] | None = None,
+        depth: float = 0.5,
     ) -> None:
         self._provider = provider
         self._model = model
@@ -106,10 +132,12 @@ class LLMSynthesizer:
         self._retries = retries
         self._instruction = instruction
         self._fields = fields or _DEFAULT_FIELDS
+        self._depth = max(0.0, min(1.0, depth))  # tunable understanding depth (cost vs gaps)
 
     def _instruction_for(self, query: str) -> str:
         instruction = self._instruction
-        return instruction(query) if callable(instruction) else instruction
+        base = instruction(query) if callable(instruction) else instruction
+        return base + _depth_directive(self._depth)
 
     def synthesize(self, query: str, chunks: list[Chunk]) -> Synthesis:
         prompt = _build_prompt(query, chunks, self._instruction_for(query), self._fields)

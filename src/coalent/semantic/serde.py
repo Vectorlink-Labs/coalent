@@ -78,6 +78,10 @@ def cognition_to_dict(unit: Cognition) -> dict[str, Any]:
         "understanding": unit.understanding,
         "evidence": [_chunk_to_dict(c) for c in unit.evidence],
         "provenance": _manifest_to_dict(unit.provenance),
+        # v0.3 — keyed by understanding; per-claim coverage; behavioral hit log.
+        "understanding_embedding": list(unit.understanding_embedding),
+        "claim_embeddings": [list(c) for c in unit.claim_embeddings],
+        "hit_queries": list(unit.hit_queries),
         "status": unit.status.value,
         "freshness_epoch": unit.freshness_epoch,
         "hits": unit.hits,
@@ -95,6 +99,12 @@ def cognition_from_dict(data: dict[str, Any]) -> Cognition:
         understanding=data.get("understanding", {}),
         evidence=tuple(_chunk_from_dict(c) for c in data.get("evidence", [])),
         provenance=_manifest_from_dict(data["provenance"]),
+        # v0.3 — absent in v0.2 JSON: default to empty (-> needs_backfill on load).
+        understanding_embedding=tuple(float(x) for x in data.get("understanding_embedding", [])),
+        claim_embeddings=tuple(
+            tuple(float(x) for x in c) for c in data.get("claim_embeddings", [])
+        ),
+        hit_queries=tuple(str(q) for q in data.get("hit_queries", [])),
         status=Status(data.get("status", "fresh")),
         freshness_epoch=data.get("freshness_epoch", 0.0),
         hits=data.get("hits", 0),

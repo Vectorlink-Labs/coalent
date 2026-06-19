@@ -3,14 +3,56 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0]
+
+Understanding-keyed matching, semantic coverage, and tunable thresholds. The cache now
+keys on what a unit **knows** (an embedding of its understanding), not the seed query —
+so "exchange policy" no longer false-hits "leave policy", while genuine paraphrases
+still hit. Coverage and escalation are semantic (per-claim), not lexical.
+
+### Added
+- **Understanding-keyed matching** — blends a *topic* score (query↔understanding
+  embedding) with the *seed* score (query↔seed query), weighted by `understanding_weight`
+  (default 0.7). Kills surface-form false hits; keeps paraphrase recall. Per-unit
+  `understanding_embedding` + `claim_embeddings`, computed at build time (batched) and
+  lazily backfilled for pre-0.3 units on load.
+- **Semantic per-claim coverage + escalation** — a hit whose best per-claim cosine is
+  below `coverage_floor` escalates to fresh raw for that query (still a hit), restoring
+  the "never less than plain retrieval" floor *semantically*. Tunable via `coverage_floor`
+  and the `enable_coverage_escalation` switch.
+- **Embedder-aware default thresholds** — `hit_threshold` / `coverage_floor` derive from
+  the embedder when unset (OpenAI ~0.33 vs lexical HashingEmbedder 0.6), so the OpenAI
+  path works out of the box. Plus `calibrate_thresholds` (labeled) and `suggest_thresholds`
+  (labels-free) helpers.
+- **`relevance_gate`** — optional `(query, chunks) -> chunks` hook applied between retrieve
+  and synthesize: de-noises the understanding, provenance, and the raw floor. BYO
+  reranker / score threshold; Coalent never reranks itself.
+- **Depth knob** — `LLMSynthesizer(depth=0.0..1.0)` trades synthesis cost against coverage
+  completeness (terse / balanced / exhaustive).
+- **`embed_many`** batch path on the embedders (one round-trip for K claims) via
+  `embed_texts`, kept off the `Embedder` protocol so custom embedders still satisfy it.
+- **Behavioral recording** — units remember the (bounded) queries that hit them
+  (`hit_queries`).
+- **Read observability** — `stats()` now reports `reads`, `hits`, `escalations`,
+  `escalation_rate`, and `hit_rate` (the "am I drifting back to RAG?" signal).
+
+### Changed
+- `coverage_floor` is now a **semantic max-per-claim cosine** (was a lexical token-overlap
+  fraction); `hit_threshold` now gates the **blended** score and auto-derives per embedder.
+- `Cognition.touch()` gained an optional `query` argument (records `hit_queries`).
+- The seed query/embedding no longer drift on re-materialization — a unit's identity is
+  its understanding, not whichever query last rebuilt it.
+
+### Removed
+- The lexical coverage gate (`_coverage_over`) — replaced by semantic per-claim coverage.
+
 ## [0.2.1]
 
 ### Added
-- **`OpenAIEmbedder`** — real semantic embeddings via the OpenAI Embeddings API (extra `coalent[openai]`); bring your own client or let it read `OPENAI_API_KEY`. Defaults to `text-embedding-3-small` (`text-embedding-3-large` for max accuracy).
-- **`FunctionEmbedder`** — wrap any `text -> sequence[float]` callable (e.g. a local sentence-transformers model) as an `Embedder`.
-
-### Changed
-- **Smart default embedder.** When no `embedder` is passed, `SemanticCache` now auto-uses `OpenAIEmbedder` if the `openai` package is installed and `OPENAI_API_KEY` is set — accurate, semantic cache matching out of the box. Otherwise it falls back to the lexical `HashingEmbedder` **and emits a warning** (keyword-overlap matching can miss semantically-similar queries). Always overridable with `embedder=`.
+- **OpenAIEmbedder** and **FunctionEmbedder**, plus a smart `default_embedder` that
+  auto-uses OpenAI embeddings when `coalent[openai]` is installed and `OPENAI_API_KEY` is
+  set, otherwise falls back to the lexical `HashingEmbedder` with a warning — semantic
+  cache hits out of the box on the recommended path.
 
 ## [0.2.0]
 

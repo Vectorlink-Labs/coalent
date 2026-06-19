@@ -15,7 +15,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..domain.models import ChangeEvent, ProvenanceManifest, SourceSpan
-from .embedding import Embedder, cosine, default_embedder, tokenize
+from .embedding import (
+    Embedder,
+    cosine,
+    default_embedder,
+    default_thresholds_for,
+    embed_texts,
+    tokenize,
+)
 from .ports import Chunk, Retriever, Synthesizer
 from .store import CognitionStore
 from .unit import Cognition
@@ -97,8 +104,13 @@ class SemanticCache:
         synthesizer: Synthesizer,
         *,
         embedder: Embedder | None = None,
-        hit_threshold: float = 0.6,
-        coverage_floor: float = 0.5,
+        hit_threshold: float | None = None,
+        coverage_floor: float | None = None,
+        understanding_weight: float = 0.7,
+        learn_behavior: bool = True,
+        max_hit_queries: int = 16,
+        enable_coverage_escalation: bool = True,
+        relevance_gate: Callable[[str, list[Chunk]], list[Chunk]] | None = None,
         strategy: str = ContextStrategy.CONTEXT_FIRST,
         store: CognitionStore | None = None,
         freshness: FreshnessPolicy | None = None,
@@ -107,8 +119,17 @@ class SemanticCache:
         self._retriever = retriever
         self._synth = synthesizer
         self._embedder: Embedder = embedder if embedder is not None else default_embedder()
-        self._threshold = hit_threshold
-        self._coverage_floor = coverage_floor
+        # Thresholds derive from the embedder when unset: OpenAI cosines are compressed
+        # (~0.33), the lexical HashingEmbedder scores higher (~0.6) — one fixed default
+        # can't fit both. Override explicitly, or tune via coalent.calibrate_thresholds.
+        hit_default, cov_default = default_thresholds_for(self._embedder)
+        self._threshold = hit_default if hit_threshold is None else hit_threshold
+        self._coverage_floor = cov_default if coverage_floor is None else coverage_floor
+        self._understanding_weight = understanding_weight
+        self._learn_behavior = learn_behavior
+        self._max_hit_queries = max_hit_queries
+        self._enable_coverage_escalation = enable_coverage_escalation
+        self._relevance_gate = relevance_gate
         self._strategy = strategy
         self._store = store
         self._freshness = freshness
@@ -116,10 +137,17 @@ class SemanticCache:
         self._units: dict[str, Cognition] = {}
         self._artifact_index: dict[str, set[str]] = {}
         self._entity_index: dict[str, set[str]] = {}
-        # Restart-safe: load persisted units and rebuild the invalidation indexes.
+        # Read-time observability (escalation rate is the "am I drifting to RAG?" signal).
+        self._reads_total = 0
+        self._reads_hit = 0
+        self._reads_escalated = 0
+        # Restart-safe: load persisted units, backfill pre-v0.3 ones (compute their
+        # understanding/claim embeddings once), and rebuild the invalidation indexes.
         if store is not None:
             for unit in store.all():
                 self._units[unit.id] = unit
+                if unit.needs_backfill and unit.understanding:
+                    self._backfill_cognition(unit)
                 self._reindex(unit)
 
     def _persist(self, unit: Cognition) -> None:
@@ -155,7 +183,12 @@ class SemanticCache:
             unit = self._units[best_id]
             self._refresh_if_expired(unit)
             if unit.is_fresh:
-                unit.touch()
+                # Behavioral seed: remember the query that hit (recording only in 0.3.0;
+                # in-memory like the hit counter — not yet persisted per-hit).
+                unit.touch(
+                    query if self._learn_behavior else None,
+                    max_queries=self._max_hit_queries,
+                )
                 cache_hit = True
             else:
                 # Stale (dirtied by a change or TTL) -> re-materialize THIS unit.
@@ -169,14 +202,29 @@ class SemanticCache:
             cache_hit = False
             confidence = max(best_score, 0.0)
 
+        self._reads_total += 1
+        if cache_hit:
+            self._reads_hit += 1
+
         evidence = list(unit.evidence)
-        coverage = self._coverage_over(query, unit.understanding, evidence)
+        coverage = self._semantic_coverage(qe, unit)
         escalated = False
-        # Coverage gate: a hit that under-covers escalates to fresh raw (no LLM call).
-        if cache_hit and coverage < self._coverage_floor:
-            evidence = self._augment(evidence, self._retriever.retrieve(query, namespace=ns or None))
-            coverage = self._coverage_over(query, unit.understanding, evidence)
+        # Semantic coverage gate: a HIT whose best per-claim match under-covers the query
+        # escalates to fresh raw for THIS query (a retrieval, no LLM call) — still a hit.
+        # Only when raw isn't already shipped AND escalation could surface it (so
+        # CONTEXT_RAW/CONTEXT_ONLY don't waste a fetch), the switch is on, and the unit
+        # isn't structured passthrough (already minimal — nothing to escalate to).
+        if (
+            cache_hit
+            and self._enable_coverage_escalation
+            and coverage < self._coverage_floor
+            and not self._emits_raw(strat, escalated=False)
+            and self._emits_raw(strat, escalated=True)
+            and not unit.understanding.get("_passthrough")
+        ):
+            evidence = self._augment(evidence, self._retrieve(query, ns))
             escalated = True
+            self._reads_escalated += 1
 
         return Result(
             understanding=dict(unit.understanding),
@@ -191,13 +239,27 @@ class SemanticCache:
             escalated=escalated,
         )
 
+    def _match_score(self, qe: tuple[float, ...], unit: Cognition) -> float:
+        """Hybrid match: key on what the unit KNOWS, with the seed query as a recall
+        floor. ``topic`` = query<->understanding-embedding (kills surface-form false
+        hits like "exchange policy" matching "leave policy"); ``seed`` = query<->seed
+        query (keeps genuine paraphrases). Blend, weighted toward topic. Falls back to
+        pure seed when the understanding embedding is missing (un-backfilled unit, or a
+        zero vector under HashingEmbedder) so matching never silently under-fires."""
+        seed = cosine(qe, unit.query_embedding)
+        if not unit.understanding_embedding:
+            return seed
+        topic = cosine(qe, unit.understanding_embedding)
+        w = self._understanding_weight
+        return w * topic + (1.0 - w) * seed
+
     def _best_match(self, qe: tuple[float, ...], ns: str) -> tuple[str | None, float]:
         best_id: str | None = None
         best = -1.0
         for unit_id, unit in self._units.items():
             if unit.namespace != ns:
                 continue
-            score = cosine(qe, unit.query_embedding)
+            score = self._match_score(qe, unit)
             if score > best:
                 best, best_id = score, unit_id
         return best_id, best
@@ -214,10 +276,20 @@ class SemanticCache:
             provenance=ProvenanceManifest("none", "none"),
         )
 
+    def _retrieve(self, query: str, ns: str) -> list[Chunk]:
+        """Retrieve, then optionally drop irrelevant chunks via the ``relevance_gate``
+        hook (BYO reranker / score threshold). De-noises the understanding, provenance,
+        AND the raw floor in one place — used by both materialize and escalation. With
+        no gate it is plain retrieval. Coalent never reranks itself ("context != retriever")."""
+        chunks = self._retriever.retrieve(query, namespace=ns or None)
+        if self._relevance_gate is not None:
+            chunks = list(self._relevance_gate(query, chunks))
+        return chunks
+
     def _materialize_into(
         self, unit: Cognition, query: str, qe: tuple[float, ...], ns: str
     ) -> None:
-        chunks = self._retriever.retrieve(query, namespace=ns or None)
+        chunks = self._retrieve(query, ns)
         synthesis = self._synth.synthesize(query, chunks)
         understanding = dict(synthesis.understanding)
 
@@ -239,28 +311,85 @@ class SemanticCache:
             SourceSpan.from_text(chunk.artifact_id, chunk.text, version=chunk.version)
             for chunk in cited
         )
-        unit.query = query
-        unit.query_embedding = qe
+        # Seed query is the unit's BIRTH identity — set once (by _new_unit), never on
+        # a stale re-materialize, so the key can't drift toward whatever triggered it.
+        if not unit.query_embedding:
+            unit.query = query
+            unit.query_embedding = qe
         unit.understanding = understanding
         unit.evidence = tuple(chunks)  # retain ALL raw — the floor, regardless of citations
         unit.provenance = ProvenanceManifest("synth@1", "semantic@2", source_spans=spans)
-        unit.touch()
+        # Key on what the unit KNOWS: (re)compute the understanding + per-claim embeddings.
+        unit.understanding_embedding, unit.claim_embeddings = self._cognition_embeddings(
+            understanding
+        )
+        unit.touch()  # a build, not a hit -> no query recorded
         self._mark_fresh(unit)
         self._reindex(unit)
         self._persist(unit)
 
-    # ------------------------------------------------ context intelligence
-    @staticmethod
-    def _coverage_over(query: str, understanding: dict[str, Any], evidence: list[Chunk]) -> float:
-        """Fraction of the query's salient terms represented in understanding + raw."""
-        terms = set(tokenize(query))
-        if not terms:
-            return 1.0
-        words = set(tokenize(SemanticCache._text_of(understanding, evidence)))
-        return len(terms & words) / len(terms)
+    def _understanding_digest(self, understanding: dict[str, Any]) -> str:
+        """Text the understanding-embedding is taken over: summary + claims + facts."""
+        return self._text_of(understanding)
 
     @staticmethod
-    def _text_of(understanding: dict[str, Any], evidence: list[Chunk]) -> str:
+    def _claim_texts(understanding: dict[str, Any]) -> list[str]:
+        """Atomic spans to embed for per-claim semantic coverage: each claim, plus the
+        summary as a fallback so a summary-only unit still gets coverage. A structured
+        claim (a dict, e.g. ``{"claim": ..., "source": ...}``) contributes its text field
+        so per-claim embeddings stay clean rather than embedding dict syntax."""
+        texts: list[str] = []
+        claims = understanding.get("claims")
+        if isinstance(claims, list):
+            for claim in claims:
+                if isinstance(claim, dict):
+                    text = str(claim.get("claim") or claim.get("text") or claim).strip()
+                else:
+                    text = str(claim).strip()
+                if text:
+                    texts.append(text)
+        summary = understanding.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            texts.append(summary)
+        return texts
+
+    def _cognition_embeddings(
+        self, understanding: dict[str, Any]
+    ) -> tuple[tuple[float, ...], tuple[tuple[float, ...], ...]]:
+        """Embed the understanding digest + each claim — the two embeddings the v0.3
+        matcher/coverage key on. Per-claim is batched via ``embed_many`` when the
+        embedder supports it. Centralized so materialize and backfill agree."""
+        digest = self._understanding_digest(understanding)
+        # Only key on the understanding when the digest has real lexical content; a
+        # trivial digest embeds to a meaningless (often zero) vector that would drag
+        # the blend down even for an identical query. Empty -> matcher uses pure seed.
+        u_emb: tuple[float, ...] = tuple(self._embedder.embed(digest)) if tokenize(digest) else ()
+        claim_texts = self._claim_texts(understanding)
+        c_embs = tuple(tuple(v) for v in embed_texts(self._embedder, claim_texts))
+        return u_emb, c_embs
+
+    def _backfill_cognition(self, unit: Cognition) -> None:
+        """One-time upgrade of a pre-v0.3 unit: compute + persist its embeddings."""
+        unit.understanding_embedding, unit.claim_embeddings = self._cognition_embeddings(
+            unit.understanding
+        )
+        self._persist(unit)
+
+    # ------------------------------------------------ context intelligence
+    def _semantic_coverage(self, qe: tuple[float, ...], unit: Cognition) -> float:
+        """How well the unit's best single claim addresses THIS query: max cosine of the
+        query against each per-claim embedding. 1.0 when there are no claims to judge by
+        (can't prove a gap — don't penalize a structured/passthrough unit). Under
+        HashingEmbedder this degrades to per-claim keyword overlap (a lexical floor);
+        with a semantic embedder it catches paraphrased gaps a lexical gate would miss."""
+        if not unit.claim_embeddings:
+            return 1.0
+        return max(cosine(qe, ce) for ce in unit.claim_embeddings)
+
+    @staticmethod
+    def _text_of(understanding: dict[str, Any]) -> str:
+        """Flatten the understanding (summary + claims + entities + facts) to text — what
+        the understanding-embedding and the digest are taken over."""
         parts: list[str] = []
         summary = understanding.get("summary")
         if isinstance(summary, str):
@@ -272,7 +401,6 @@ class SemanticCache:
         facts = understanding.get("facts")
         if isinstance(facts, dict):
             parts.extend(f"{name} {val}" for name, val in facts.items())
-        parts.extend(chunk.text for chunk in evidence)
         return " ".join(parts)
 
     @staticmethod
@@ -287,6 +415,17 @@ class SemanticCache:
         return merged
 
     @staticmethod
+    def _emits_raw(strategy: str, escalated: bool) -> bool:
+        """Whether the projected context will contain the raw evidence — the exact
+        rule ``_project`` applies. The coverage gate MUST measure over the same
+        payload, or the gate and the projector disagree (the RAG-floor bug)."""
+        if strategy == ContextStrategy.CONTEXT_ONLY:
+            return False
+        if strategy == ContextStrategy.CONTEXT_RAW:
+            return True
+        return escalated  # CONTEXT_FIRST: raw only once escalated
+
+    @staticmethod
     def _project(
         understanding: dict[str, Any],
         evidence: list[Chunk],
@@ -295,12 +434,11 @@ class SemanticCache:
         escalated: bool,
     ) -> dict[str, Any]:
         projected = SemanticCache._project_understanding(understanding, query)
-        if strategy == ContextStrategy.CONTEXT_ONLY:
-            raw: list[str] = []
-        elif strategy == ContextStrategy.CONTEXT_RAW:
-            raw = [chunk.text for chunk in evidence]
-        else:  # CONTEXT_FIRST: include raw only when we had to escalate
-            raw = [chunk.text for chunk in evidence] if escalated else []
+        raw = (
+            [chunk.text for chunk in evidence]
+            if SemanticCache._emits_raw(strategy, escalated)
+            else []
+        )
         return {"understanding": projected, "raw": raw}
 
     @staticmethod
@@ -380,7 +518,7 @@ class SemanticCache:
             unit = self._units.get(unit_id)
             if unit is None or not unit.is_fresh or unit.namespace != ns:
                 continue
-            scored.append((cosine(qe, unit.query_embedding), unit_id, relation, unit))
+            scored.append((self._match_score(qe, unit), unit_id, relation, unit))
         scored.sort(key=lambda item: item[0], reverse=True)
         return [
             Related(
@@ -499,5 +637,17 @@ class SemanticCache:
         return True  # cannot prove unchanged -> conservatively changed
 
     # ------------------------------------------------------------------ misc
-    def stats(self) -> dict[str, int]:
-        return {"units": len(self._units), "tracked_artifacts": len(self._artifact_index)}
+    def stats(self) -> dict[str, float]:
+        """Cache size + read-time observability. ``escalation_rate`` is the fraction of
+        cache HITS that fell back to fresh raw — a high value means the cached
+        understanding under-covers real queries (deepen it, or lower coverage_floor)."""
+        hits = self._reads_hit
+        return {
+            "units": len(self._units),
+            "tracked_artifacts": len(self._artifact_index),
+            "reads": self._reads_total,
+            "hits": hits,
+            "escalations": self._reads_escalated,
+            "escalation_rate": round(self._reads_escalated / hits, 3) if hits else 0.0,
+            "hit_rate": round(hits / self._reads_total, 3) if self._reads_total else 0.0,
+        }

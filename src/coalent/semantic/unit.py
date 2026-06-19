@@ -24,6 +24,10 @@ class Cognition:
     understanding: dict[str, Any]
     evidence: tuple[Chunk, ...]             # retained raw — guarantees the RAG floor
     provenance: ProvenanceManifest          # which sources it depends on (invalidation)
+    # --- v0.3: the unit is keyed by what it KNOWS, not the seed query ---
+    understanding_embedding: tuple[float, ...] = ()       # embedding of the understanding digest
+    claim_embeddings: tuple[tuple[float, ...], ...] = ()  # per-claim embeddings (semantic coverage)
+    hit_queries: tuple[str, ...] = ()                     # behavioral: queries that hit this unit
     status: Status = Status.FRESH
     freshness_epoch: float = field(default_factory=time.time)
     hits: int = 0
@@ -34,9 +38,17 @@ class Cognition:
     def is_fresh(self) -> bool:
         return self.status == Status.FRESH
 
-    def touch(self) -> None:
+    @property
+    def needs_backfill(self) -> bool:
+        """A pre-v0.3 unit (no understanding embedding yet) — backfill once on load."""
+        return not self.understanding_embedding
+
+    def touch(self, query: str | None = None, *, max_queries: int = 16) -> None:
         self.hits += 1
         self.last_access = time.time()
+        # Behavioral seed: remember the queries that actually hit this unit (bounded).
+        if query and query not in self.hit_queries:
+            self.hit_queries = (self.hit_queries + (query,))[-max_queries:]
 
     def mark_dirty(self) -> None:
         self.status = Status.DIRTY
