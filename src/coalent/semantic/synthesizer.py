@@ -24,18 +24,12 @@ _SYSTEM = (
     "prose, no markdown, no code fences."
 )
 
-#: User-owned (overridable). What understanding to produce. Query-INDEPENDENT and
-#: comprehensive by design: the understanding is cached and reused across DIFFERENT
-#: future questions about the same sources, so it must capture the whole source's key
-#: points — not just what answers the question that happened to build it.
+#: User-owned (overridable). What understanding to produce.
 _DEFAULT_INSTRUCTION = (
-    "Produce a faithful, REUSABLE understanding of the provided sources — independent "
-    "of any single question, because it is cached and reused to answer other questions "
-    "about the same material. Cover the sources' key points comprehensively: a summary "
-    "of what matters, the key claims (each grounded in a source), the salient entities, "
-    "and the concrete facts (names, numbers, dates, amounts, conditions, fees, and "
-    "exceptions). Capture every detail a later question might reasonably ask about; be "
-    "comprehensive about the sources but tight in wording — no padding, never invent."
+    "Produce a faithful, decision-ready understanding of the question: a concise "
+    "summary of what actually matters for a decision, the key claims (each grounded "
+    "in a source), the salient entities, and the concrete facts (names, numbers, "
+    "dates, statuses). Be specific and tight — no padding."
 )
 
 #: An instruction is either a fixed string or computed per query.
