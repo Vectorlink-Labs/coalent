@@ -42,7 +42,7 @@ coalent = "coalent.cli:main"
 [project.urls]
 Homepage = "https://github.com/Vectorlink-Labs/coalent"
 Repository = "https://github.com/Vectorlink-Labs/coalent"
-Documentation = "https://github.com/Vectorlink-Labs/coalent#readme"
+Documentation = "https://coalent.ai/docs"
 Issues = "https://github.com/Vectorlink-Labs/coalent/issues"
 
 [tool.hatch.build.targets.wheel]
@@ -60,3 +60,10 @@ target-version = "py310"
 python_version = "3.10"
 strict = true
 ignore_missing_imports = true
+
+# The optional FastAPI receiver (events/http.py, `server` extra) uses `@app.post`,
+# whose type is unknown when fastapi isn't installed — so the documented `.[dev]`
+# gate (no server extra) doesn't flag it as an untyped decorator.
+[[tool.mypy.overrides]]
+module = "coalent.events.http"
+disallow_untyped_decorators = false
