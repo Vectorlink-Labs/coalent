@@ -76,9 +76,13 @@ cache.source_changed("confluence:hr", text="Leave policy: now 25 days.")
 Wire in a real model — any text-in / text-out LLM works:
 
 ```python
-from coalent import SemanticCache, LLMSynthesizer, OpenAIProvider
+from coalent import SemanticCache, LLMSynthesizer, OpenAIProvider, OpenAIEmbedder
 
-cache = SemanticCache(retriever, LLMSynthesizer(OpenAIProvider(), model="gpt-4o-mini"))
+cache = SemanticCache(
+    retriever,
+    LLMSynthesizer(OpenAIProvider(), model="gpt-4o-mini"),
+    embedder=OpenAIEmbedder(),   # match queries by MEANING (recommended for real use)
+)
 ```
 
 ## How it works
@@ -101,6 +105,24 @@ cache = SemanticCache(retriever, LLMSynthesizer(OpenAIProvider(), model="gpt-4o-
 4. **A source changes** → `source_changed(id)` marks only the units whose provenance includes that id; they rebuild lazily on the next read.
 
 Unchanged content is skipped via a content-hash compare, so a no-op change costs nothing.
+
+## Matching, coverage & the RAG floor
+
+Coalent keys on what a unit **knows** — an embedding of its *understanding*, not the query's words — so *"how many vacation days?"* hits your leave unit, while *"exchange policy"* does **not** false-hit it. Every hit is then checked for **coverage**: if the cached understanding doesn't actually answer this query, Coalent **escalates** to the retained raw evidence (a fresh retrieval, no extra LLM call). So it can never return *less* than plain retrieval — and never silently answers wrong.
+
+It's all tunable, and **the default path needs no heavy dependency** (pure cosine, no extra model calls):
+
+| Knob | Default | What it does |
+|---|---|---|
+| `hit_threshold` / `coverage_floor` | auto-derived per embedder | or tune with `calibrate_thresholds()` (labeled) / `suggest_thresholds()` (labels-free) |
+| `coverage_scorer` | off (cosine) | plug a cross-encoder / NLI / **LLM entailment** check for containment-grade coverage |
+| `coverage_ceiling` | `1.0` | two-tier: consult the scorer only on borderline queries (keeps it cheap) |
+| `route_by_claim` | off | route by the unit's best-matching claim (late interaction) |
+| `relevance_gate` | off | drop irrelevant chunks before synthesis (bring your own reranker) |
+| `depth` (on `LLMSynthesizer`) | `0.5` | trade understanding depth against synthesis cost |
+| `enable_coverage_escalation` | on | the RAG-floor safety net |
+
+`stats()` reports `hit_rate` and `escalation_rate`, so you can see — and tune — exactly what the cache is doing.
 
 ## Bring your own stack
 
