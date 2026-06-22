@@ -20,6 +20,14 @@ still hit. Coverage and escalation are semantic (per-claim), not lexical.
   below `coverage_floor` escalates to fresh raw for that query (still a hit), restoring
   the "never less than plain retrieval" floor *semantically*. Tunable via `coverage_floor`
   and the `enable_coverage_escalation` switch.
+- **Pluggable coverage scorer + two-tier** — cosine over per-claim embeddings stays the
+  zero-dep default; an optional `coverage_scorer(query, understanding) -> float` (a
+  cross-encoder / NLI / LLM entailment check) decides *containment* where cosine can't
+  tell "adjacent topic" from "actually answers". `coverage_ceiling` consults the scorer
+  only in the ambiguous band, so you pay for it on the few borderline queries, not every hit.
+- **Per-claim routing (`route_by_claim`)** — optional late-interaction matching that routes
+  a query by the unit's best-matching claim instead of its averaged understanding, so a
+  query finds the unit holding a claim about it even inside a fat multi-claim unit.
 - **Embedder-aware default thresholds** — `hit_threshold` / `coverage_floor` derive from
   the embedder when unset (OpenAI ~0.33 vs lexical HashingEmbedder 0.6), so the OpenAI
   path works out of the box. Plus `calibrate_thresholds` (labeled) and `suggest_thresholds`

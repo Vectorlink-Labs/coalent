@@ -107,9 +107,12 @@ class SemanticCache:
         hit_threshold: float | None = None,
         coverage_floor: float | None = None,
         understanding_weight: float = 0.7,
+        route_by_claim: bool = False,
         learn_behavior: bool = True,
         max_hit_queries: int = 16,
         enable_coverage_escalation: bool = True,
+        coverage_scorer: Callable[[str, dict[str, Any]], float] | None = None,
+        coverage_ceiling: float = 1.0,
         relevance_gate: Callable[[str, list[Chunk]], list[Chunk]] | None = None,
         strategy: str = ContextStrategy.CONTEXT_FIRST,
         store: CognitionStore | None = None,
@@ -126,9 +129,12 @@ class SemanticCache:
         self._threshold = hit_default if hit_threshold is None else hit_threshold
         self._coverage_floor = cov_default if coverage_floor is None else coverage_floor
         self._understanding_weight = understanding_weight
+        self._route_by_claim = route_by_claim
         self._learn_behavior = learn_behavior
         self._max_hit_queries = max_hit_queries
         self._enable_coverage_escalation = enable_coverage_escalation
+        self._coverage_scorer = coverage_scorer
+        self._coverage_ceiling = coverage_ceiling
         self._relevance_gate = relevance_gate
         self._strategy = strategy
         self._store = store
@@ -207,7 +213,17 @@ class SemanticCache:
             self._reads_hit += 1
 
         evidence = list(unit.evidence)
+        # Coverage = "does the unit actually answer THIS query?". Two-tier: cheap cosine over
+        # per-claim embeddings decides the clear cases for free; the (more expensive)
+        # coverage_scorer (cross-encoder / NLI / LLM entailment) is consulted ONLY in the
+        # ambiguous band [coverage_floor, coverage_ceiling) where cosine can't tell "adjacent"
+        # from "answers" — containment accuracy at a fraction of the per-query cost.
         coverage = self._semantic_coverage(qe, unit)
+        if (
+            self._coverage_scorer is not None
+            and self._coverage_floor <= coverage < self._coverage_ceiling
+        ):
+            coverage = self._coverage_scorer(query, dict(unit.understanding))
         escalated = False
         # Semantic coverage gate: a HIT whose best per-claim match under-covers the query
         # escalates to fresh raw for THIS query (a retrieval, no LLM call) — still a hit.
@@ -247,9 +263,15 @@ class SemanticCache:
         pure seed when the understanding embedding is missing (un-backfilled unit, or a
         zero vector under HashingEmbedder) so matching never silently under-fires."""
         seed = cosine(qe, unit.query_embedding)
-        if not unit.understanding_embedding:
+        if self._route_by_claim and unit.claim_embeddings:
+            # Late-interaction: route by the unit's BEST-matching claim, not its averaged
+            # understanding — so a query finds the unit holding a claim about it, even in a
+            # fat multi-claim unit, instead of landing on a topically-adjacent centroid.
+            topic = max(cosine(qe, ce) for ce in unit.claim_embeddings)
+        elif unit.understanding_embedding:
+            topic = cosine(qe, unit.understanding_embedding)
+        else:
             return seed
-        topic = cosine(qe, unit.understanding_embedding)
         w = self._understanding_weight
         return w * topic + (1.0 - w) * seed
 
