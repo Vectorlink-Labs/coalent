@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "coalent"
-version = "0.3.0"
+version = "0.4.0"
 description = "A real-time, provenance-invalidated cognitive cache layer for AI agents and RAG."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -51,6 +51,9 @@ packages = ["src/coalent"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "openai: v0.4 accuracy tier — needs a real OPENAI_API_KEY; skipped offline",
+]
 
 [tool.ruff]
 line-length = 100

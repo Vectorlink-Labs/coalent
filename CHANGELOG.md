@@ -3,6 +3,46 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0]
+
+Cognition units, on by default. v0.4 turns the seed query into **query-independent
+extractive understanding** and adds **cross-unit claim recall** — and, unlike an opt-in
+preview, both are now the **defaults**, because they are strictly better on the structured /
+reuse-heavy corpora Coalent targets. A prose summary silently drops facts (in our tests
+~40% of the numbers in a source); extractive units keep them all and let one cached unit
+answer many later questions. Recall lets the cache answer multi-hop questions that span
+documents — at zero extra LLM calls. Both have a one-line escape hatch back to exact v0.3.
+
+### Added
+- **Extractive understanding** — `LLMSynthesizer(extract=True)` builds a query-INDEPENDENT
+  list of atomic, source-grounded claims instead of a question-shaped prose summary, so the
+  same unit serves many different later questions and no number is lost. Now the default;
+  pass `extract=False` for the v0.3 prose path. Exposes `EXTRACTIVE_INSTRUCTION`.
+- **Cross-unit claim recall** — `SemanticCache(cross_unit_recall=True)` pools per-claim
+  memory across ALL fresh units and surfaces the best-matching claims (MaxSim) when the
+  single matched unit under-covers a query — recovering a bridge fact that lives in another
+  unit (multi-hop) with no extra LLM call, only cosine over cached claims. Dormant (free) on
+  single-hop and auto-disabled under a non-semantic embedder. `recall_threshold` controls
+  when it fires (defaults to `coverage_floor`); `recall_limit` bounds the pool. Now the
+  default; pass `cross_unit_recall=False` to restore v0.3.
+- **`hit_margin`** — refuse to commit to a unit that only ties a topical neighbour by less
+  than the margin (materialise the query's own unit instead). Opt-in precision guard for
+  ambiguous / collision-heavy corpora.
+- **`select_floor`** — serve the matched unit's atoms by MEANING (per-claim cosine ≥ floor)
+  rather than the lexical keyword trim: the query-relevant facts, fewer tokens. Opt-in.
+- **`residual_floor`** — at build time, retain number-bearing source spans the extractor
+  dropped (best per-claim cosine < floor) as extra atoms, closing the extractor-recall gap
+  on messy prose. Embedding-only, no extra LLM call. Opt-in (`residual_limit` bounds it).
+- **`Usage` / `Generation`** surfaced on the synthesizer port for read-cost accounting.
+
+### Changed
+- **Defaults flipped ON: `extract=True` and `cross_unit_recall=True`.** They are strictly
+  better on structured / reuse workloads and free-or-dormant elsewhere, so they now ship on.
+  Upgrading changes the shape of cached understanding (atomic claims, not prose). To keep the
+  exact v0.3 read behaviour, pass `extract=False` and `cross_unit_recall=False` — see
+  [UPGRADE-0.3-to-0.4.md](UPGRADE-0.3-to-0.4.md). The situational knobs (`hit_margin`,
+  `select_floor`, `residual_floor`, `coverage_scorer`) stay OFF by default.
+
 ## [0.3.0]
 
 Understanding-keyed matching, semantic coverage, and tunable thresholds. The cache now

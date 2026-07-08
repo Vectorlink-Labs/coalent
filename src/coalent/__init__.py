@@ -33,6 +33,8 @@ from .semantic import (
     FunctionEmbedder,
     FunctionRetriever,
     HashingEmbedder,
+    EXTRACTIVE_INSTRUCTION,
+    Generation,
     InMemoryCognitionStore,
     InMemoryRetriever,
     InvalidationResult,
@@ -51,6 +53,7 @@ from .semantic import (
     StubSynthesizer,
     Synthesis,
     Synthesizer,
+    Usage,
     calibrate_thresholds,
     cosine,
     default_thresholds_for,
@@ -72,7 +75,7 @@ from .events import (
     verify_github_signature,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
@@ -88,8 +91,11 @@ __all__ = [
     "Retriever",
     "Synthesizer",
     "Synthesis",
+    "Usage",
+    "Generation",
     "LLMProvider",
     "LLMSynthesizer",
+    "EXTRACTIVE_INSTRUCTION",
     "JSONPassthroughSynthesizer",
     "Embedder",
     "HashingEmbedder",

@@ -81,6 +81,7 @@ def cognition_to_dict(unit: Cognition) -> dict[str, Any]:
         # v0.3 — keyed by understanding; per-claim coverage; behavioral hit log.
         "understanding_embedding": list(unit.understanding_embedding),
         "claim_embeddings": [list(c) for c in unit.claim_embeddings],
+        "synth_tokens": unit.synth_tokens,
         "hit_queries": list(unit.hit_queries),
         "status": unit.status.value,
         "freshness_epoch": unit.freshness_epoch,
@@ -104,6 +105,7 @@ def cognition_from_dict(data: dict[str, Any]) -> Cognition:
         claim_embeddings=tuple(
             tuple(float(x) for x in c) for c in data.get("claim_embeddings", [])
         ),
+        synth_tokens=int(data.get("synth_tokens", 0)),  # absent in pre-v0.4 JSON -> 0
         hit_queries=tuple(str(q) for q in data.get("hit_queries", [])),
         status=Status(data.get("status", "fresh")),
         freshness_epoch=data.get("freshness_epoch", 0.0),

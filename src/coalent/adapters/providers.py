@@ -11,6 +11,8 @@ import os
 import re
 from typing import Any
 
+from ..semantic.ports import Generation, Usage
+
 
 class StubProvider:
     """Deterministic, network-free provider for development and tests.
@@ -40,16 +42,18 @@ class StubProvider:
 class OpenAIProvider:
     """Thin adapter over the OpenAI Chat Completions API (``openai`` extra)."""
 
-    def __init__(self, *, api_key: str | None = None, base_url: str | None = None) -> None:
-        from openai import OpenAI  # lazy: only required when actually used
+    def __init__(
+        self, *, api_key: str | None = None, base_url: str | None = None, client: Any = None
+    ) -> None:
+        if client is None:
+            from openai import OpenAI  # lazy: only required when actually used
 
-        self._client: Any = OpenAI(
-            api_key=api_key or os.environ.get("OPENAI_API_KEY"), base_url=base_url
-        )
+            client = OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"), base_url=base_url)
+        self._client: Any = client  # inject your own client (or a fake) to bypass the SDK
 
     def generate(
         self, *, model: str, system: str, user: str, max_tokens: int, temperature: float
-    ) -> str:
+    ) -> Generation:
         response = self._client.chat.completions.create(
             model=model,
             messages=[
@@ -60,22 +64,33 @@ class OpenAIProvider:
             temperature=temperature,
         )
         content = response.choices[0].message.content
-        return content if isinstance(content, str) else ""
+        text = content if isinstance(content, str) else ""
+        raw = getattr(response, "usage", None)
+        usage = (
+            Usage(
+                prompt_tokens=int(getattr(raw, "prompt_tokens", 0) or 0),
+                completion_tokens=int(getattr(raw, "completion_tokens", 0) or 0),
+                model=model,
+            )
+            if raw is not None
+            else None
+        )
+        return Generation(text=text, usage=usage)
 
 
 class AnthropicProvider:
     """Thin adapter over the Anthropic Messages API (``anthropic`` extra)."""
 
-    def __init__(self, *, api_key: str | None = None) -> None:
-        import anthropic  # lazy
+    def __init__(self, *, api_key: str | None = None, client: Any = None) -> None:
+        if client is None:
+            import anthropic  # lazy
 
-        self._client: Any = anthropic.Anthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY")
-        )
+            client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+        self._client: Any = client  # inject your own client (or a fake) to bypass the SDK
 
     def generate(
         self, *, model: str, system: str, user: str, max_tokens: int, temperature: float
-    ) -> str:
+    ) -> Generation:
         response = self._client.messages.create(
             model=model,
             system=system,
@@ -88,4 +103,15 @@ class AnthropicProvider:
             for block in response.content
             if getattr(block, "type", None) == "text"
         ]
-        return "".join(str(part) for part in parts)
+        text = "".join(str(part) for part in parts)
+        raw = getattr(response, "usage", None)
+        usage = (
+            Usage(
+                prompt_tokens=int(getattr(raw, "input_tokens", 0) or 0),
+                completion_tokens=int(getattr(raw, "output_tokens", 0) or 0),
+                model=model,
+            )
+            if raw is not None
+            else None
+        )
+        return Generation(text=text, usage=usage)

@@ -27,6 +27,8 @@ class Cognition:
     # --- v0.3: the unit is keyed by what it KNOWS, not the seed query ---
     understanding_embedding: tuple[float, ...] = ()       # embedding of the understanding digest
     claim_embeddings: tuple[tuple[float, ...], ...] = ()  # per-claim embeddings (semantic coverage)
+    synth_tokens: int = 0                                 # v0.4: this unit's build cost in tokens —
+                                                          # a HIT credits this as saved (reload-safe)
     hit_queries: tuple[str, ...] = ()                     # behavioral: queries that hit this unit
     status: Status = Status.FRESH
     freshness_epoch: float = field(default_factory=time.time)

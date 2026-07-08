@@ -22,7 +22,8 @@
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
-  <a href="#how-it-works">How it works</a> ·
+  <a href="#whats-new-in-v04">What's new in v0.4</a> ·
+  <a href="#the-read-path--a-ladder-of-gates">Gate ladder</a> ·
   <a href="#bring-your-own-stack">Bring your own stack</a> ·
   <a href="#benchmark">Benchmark</a> ·
   <a href="#cli">CLI</a>
@@ -38,11 +39,13 @@
 
 Every context layer is forced to trade off three things. Coalent is built to hold all three at once:
 
-- 🧠 **Understanding, not chunks.** It caches the decision-ready understanding your LLM produced — *and retains the raw evidence with every unit*, so it can never return less than plain retrieval.
-- ♻️ **Reuse across queries and agents.** A semantic cache keyed by query *meaning*: ask again, or from another agent, and it's a warm hit — no re-retrieval, no re-synthesis.
+- 🧠 **Extractive understanding, not chunks.** It caches a *query-independent* set of atomic, source-grounded **claims** your LLM extracted — keeping every number and fact — so one cached unit answers many *different* later questions. The raw evidence is retained with each unit, so a hit that under-covers a query falls back to retrieval instead of answering thin.
+- ♻️ **Reuse across queries, agents — and documents.** A semantic cache keyed by query *meaning*: ask again, or from another agent, and it's a warm hit. **Cross-unit recall** pools claims across units to answer **multi-hop** questions whose evidence spans documents — at **zero extra LLM calls**.
 - 🌿 **Fresh by provenance.** Every unit remembers the exact sources it used. When one changes, only the units that actually used it go stale — precisely, automatically, and lazily.
 
-Coalent sits **above retrieval** — bring any retriever (vector DB, hybrid search, GraphRAG, tools, APIs). It's the freshness-and-reuse layer, not another retriever.
+Coalent sits **above retrieval** — bring any retriever (vector DB, hybrid search, GraphRAG, tools, APIs). It's the freshness-and-reuse layer, not another retriever — deliberately the *opposite* of GraphRAG's build-the-whole-graph-upfront tax: **lightweight, independent units, built lazily only when a query actually needs one**, and refreshed by dirtying a single unit (no graph surgery).
+
+> **New in v0.4** — extractive understanding and cross-unit recall are now **on by default** (they're strictly better on structured / reuse-heavy corpora, and free elsewhere). See [What's new](#whats-new-in-v04) and the [read-path gate ladder](#the-read-path--a-ladder-of-gates).
 
 ## Install
 
@@ -74,17 +77,29 @@ cache.source_changed("confluence:hr", text="Leave policy: now 25 days.")
 # the next matching read rebuilds just that one unit, lazily
 ```
 
-Wire in a real model — any text-in / text-out LLM works:
+Wire in a real model — any text-in / text-out LLM works. In v0.4 the synthesizer builds **extractive** understanding by default (query-independent atomic claims that keep every fact), and the cache does **cross-unit recall** — both on automatically:
 
 ```python
 from coalent import SemanticCache, LLMSynthesizer, OpenAIProvider, OpenAIEmbedder
 
 cache = SemanticCache(
     retriever,
-    LLMSynthesizer(OpenAIProvider(), model="gpt-4o-mini"),
+    LLMSynthesizer(OpenAIProvider(), model="gpt-4o-mini"),   # extract=True by default (v0.4)
     embedder=OpenAIEmbedder(),   # match queries by MEANING (recommended for real use)
 )
+# Multi-hop across documents? recall is already on; raise its trigger to bridge units:
+#   SemanticCache(retriever, synth, embedder=..., recall_threshold=0.7)
 ```
+
+## What's new in v0.4
+
+Two capabilities that were an opt-in preview are now the **defaults**, because they're strictly better on the structured / reuse-heavy corpora Coalent targets — and free or dormant everywhere else. Both have a one-line escape hatch back to exact v0.3 (`extract=False`, `cross_unit_recall=False`).
+
+- 🎯 **Extractive understanding (`extract=True`, default).** Instead of a question-shaped prose summary, the synthesizer extracts a *query-independent* list of atomic, source-grounded claims. The same unit now answers many *different* later questions, and **no number is dropped** — a prose summary silently lost ~40% of the numbers in a source in our tests.
+- 🔗 **Cross-unit claim recall (`cross_unit_recall=True`, default).** When one unit under-covers a query, the cache pools per-claim memory across **all** fresh units (MaxSim) and surfaces the bridge facts — answering **multi-hop** questions naive retrieval *structurally can't* (evidence in a document that doesn't resemble the question), at **zero extra LLM calls**. Dormant/free on single-hop; auto-off under a non-semantic embedder. Surfaced as `result.recalled`.
+- 🛡️ **Precision & serving knobs (opt-in, default off):** `hit_margin` (refuse ambiguous ties), `select_floor` (serve atoms by meaning, fewer tokens), `residual_floor` (recover extractor-missed number spans). See the [gate ladder](#the-read-path--a-ladder-of-gates) for when to reach for each.
+
+Upgrading from v0.3? See **[UPGRADE-0.3-to-0.4.md](UPGRADE-0.3-to-0.4.md)** — additive, one behaviour change (understanding is now claims, not prose).
 
 ## How it works
 
@@ -107,23 +122,35 @@ cache = SemanticCache(
 
 Unchanged content is skipped via a content-hash compare, so a no-op change costs nothing.
 
-## Matching, coverage & the RAG floor
+## The read path — a ladder of gates
 
-Coalent keys on what a unit **knows** — an embedding of its *understanding*, not the query's words — so *"how many vacation days?"* hits your leave unit, while *"exchange policy"* does **not** false-hit it. Every hit is then checked for **coverage**: if the cached understanding doesn't actually answer this query, Coalent **escalates** to the retained raw evidence (a fresh retrieval, no extra LLM call). So it can never return *less* than plain retrieval — and never silently answers wrong.
+Coalent keys on what a unit **knows** — an embedding of its *understanding*, not the query's words — so *"how many vacation days?"* hits your leave unit, while *"exchange policy"* does **not**. Every `get(query)` then walks a fixed ladder of gates. The defaults are **pure cosine** — no extra model, no heavy dependency — and each gate is a tunable knob. In firing order:
 
-It's all tunable, and **the default path needs no heavy dependency** (pure cosine, no extra model calls):
+| # | Gate | Default | Fires when → what happens |
+|---|---|---|---|
+| 1 | **`hit_threshold`** — match | auto (OpenAI ~0.33) | best unit's blended score (`0.7·topic + 0.3·seed`) below it → **miss** → retrieve + synthesize a new unit |
+| 2 | **`hit_margin`** — precision guard | `0.0` (off) | top unit beats runner-up by less than the margin → ambiguous → build the query's own unit instead |
+| 3 | **freshness** | provenance / TTL | matched unit dirty or expired → re-materialize it |
+| 4 | **coverage** — does it answer? | max per-claim cosine | how well the matched unit covers *this* query (one perfect claim = covered) |
+| 5 | **`cross_unit_recall`** | **on (v0.4)** | coverage `< recall_threshold` → pool the best claims across **all** fresh units (MaxSim), can lift coverage. Free when dormant, no LLM call |
+| 6 | **`coverage_scorer` (S2)** | `None` (off) | in the ambiguous band `[coverage_floor, coverage_ceiling)` → a cross-encoder / NLI / LLM entailment check overrides cosine |
+| 7 | **`coverage_floor`** — the RAG floor | auto (~0.28) | coverage still below it → **escalate**: append fresh raw retrieval (no LLM call), so a thin hit falls back to retrieval rather than answering wrong |
+| 8 | **`select_floor`** — serve | `None` (lexical trim) | serve the unit's atoms by *meaning* (per-claim cosine ≥ floor) instead of a keyword trim — the query-relevant facts, fewer tokens |
 
-| Knob | Default | What it does |
-|---|---|---|
-| `hit_threshold` / `coverage_floor` | auto-derived per embedder | or tune with `calibrate_thresholds()` (labeled) / `suggest_thresholds()` (labels-free) |
-| `coverage_scorer` | off (cosine) | plug a cross-encoder / NLI / **LLM entailment** check for containment-grade coverage |
-| `coverage_ceiling` | `1.0` | two-tier: consult the scorer only on borderline queries (keeps it cheap) |
-| `route_by_claim` | off | route by the unit's best-matching claim (late interaction) |
-| `relevance_gate` | off | drop irrelevant chunks before synthesis (bring your own reranker) |
-| `depth` (on `LLMSynthesizer`) | `0.5` | trade understanding depth against synthesis cost |
-| `enable_coverage_escalation` | on | the RAG-floor safety net |
+Plus one **build-time** knob — `residual_floor`: retain number-bearing source spans the extractor dropped (best per-claim cosine < floor) as extra atoms. Embedding-only.
+Other hooks: `route_by_claim` (late-interaction routing over a fat unit's claims), `relevance_gate` (BYO reranker before synthesis), `depth` (synthesis completeness vs cost), `calibrate_thresholds()` / `suggest_thresholds()`.
 
-`stats()` reports `hit_rate` and `escalation_rate`, so you can see — and tune — exactly what the cache is doing.
+**Which knob for which workload** — the defaults are tuned for structured, single-hop reuse; reach for these when your data differs:
+
+| Reach for… | When |
+|---|---|
+| **`recall_threshold ≈ 0.7`** | **multi-hop / cross-document** questions — makes recall bridge partially-covered reads (the full multi-hop win) |
+| **`hit_margin > 0`** | **contradiction- / collision-heavy** corpora where near-ties are ambiguous (costs rebuilds — leave off on clean data) |
+| **`select_floor`** | **paraphrase-heavy** queries over large units (a keyword trim misses when query and claim share no words) |
+| **`residual_floor`** | **messy real prose** where the extractor might drop a number (cheap insurance) |
+| **`coverage_scorer` (S2)** | **high-stakes ambiguity** where a wrong serve is costly (adds one judge call per borderline read) |
+
+`stats()` reports `hit_rate`, `escalation_rate`, and the active thresholds, so you can see — and tune — exactly what the cache is doing.
 
 ## Bring your own stack
 
@@ -181,15 +208,26 @@ tools = build_mcp_tools(cache)        # expose the cache as an MCP tool
 
 ## Benchmark
 
-A real-LLM, quality-first benchmark (gpt-4o-mini, graded by an independent gpt-4o judge) on number-dense documents — answering from Coalent's *understanding* vs the full raw context, with a source change midway:
+Measured honestly on the structured / reuse workload Coalent is built for — **64 sources × 3 seeds = 192 reads per condition**, real OpenAI embeddings, a **deterministic** number-and-attribute accuracy check (no LLM-judge self-preference), and a **real dense top-5 retriever shared by both arms** (the naive RAG baseline *is* that retriever). Accuracy is graded escalation-off, so a fallback can't launder a win.
 
-| System | Accuracy | Stays fresh | Context tokens / read |
-|---|:---:|:---:|:---:|
-| Full-context RAG | 100% | ✓ | 283 |
-| Normal cache (raw chunks) | 86% | ✗ stale | 283 |
-| **Coalent** | **100%** | **✓** | **96** |
+**Same accuracy as naive RAG, at a fraction of the context tokens** — across four answer models (95% CIs overlap on every model):
 
-Coalent **matches full-context RAG accuracy** (independently graded), **never goes stale** after a source change (a normal cache does), and sends **~66% fewer context tokens — up to 75% on large documents.** Cost optimization without trading away quality. *(gpt-4o corroborates within ~3%; full two-model breakdown in the [docs](https://coalent.ai/docs/benchmark).)*
+| Answer model | Naive RAG | Coalent v0.4 |
+|---|:---:|:---:|
+| gpt-4o-mini  | 0.81 | 0.81 |
+| gpt-4.1-mini | 0.90 | 0.85 |
+| gpt-4o       | 0.90 | 0.87 |
+| gpt-4.1      | 0.99 | 0.97 |
+| **Context tokens / read** | **126** | **47** |
+
+And on the metrics that decide whether a cache is *trustworthy*, not just cheap:
+
+- 🎯 **Routing — `route@1 ≈ 1.00`.** The cache picks the correct source unit essentially every time.
+- 🛡️ **Misattribution — `~0–2%`.** How often it serves a number from the *wrong* source — the same noise floor as naive RAG's own answerer. (An earlier "27%" traced back to a benchmark bug — contradictory duplicate sources no router can resolve; found, fixed, documented. See the [transparency note](https://coalent.ai/docs/benchmark).)
+- 🔗 **Multi-hop — naive `0%` → Coalent `100%`.** On bridge questions whose second-hop evidence doesn't resemble the question, single-shot retrieval answers **0%**; cross-unit recall answers **100%**, at **zero extra LLM calls**.
+- 💰 **Economics — build once, reuse cheaply.** Understanding costs ~430 tokens / ~4s to build per source (once), then every later read is a warm cosine hit at ~⅓ the context. **Break-even ≈ 4–5 reads per source** — cheaper forever after.
+
+*Full per-model and per-knob breakdown, methodology, and the benchmark-transparency note (what we found, fixed, and how) in the [docs](https://coalent.ai/docs/benchmark).*
 
 ## CLI
 

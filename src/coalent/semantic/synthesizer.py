@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from .ports import Chunk, LLMProvider, Synthesis
+from .ports import Chunk, Generation, LLMProvider, Synthesis, Usage
 
 #: Coalent-owned. Always present — the role, grounding rules, and output format.
 _SYSTEM = (
@@ -30,6 +30,20 @@ _DEFAULT_INSTRUCTION = (
     "summary of what actually matters for a decision, the key claims (each grounded "
     "in a source), the salient entities, and the concrete facts (names, numbers, "
     "dates, statuses). Be specific and tight — no padding."
+)
+
+#: ``extract=True`` swaps in this QUERY-INDEPENDENT extractive instruction. It stops answering the
+#: seed query and instead extracts every atomic fact, so the SAME source yields the same unit no
+#: matter which query first touched it — which is what lets one cached unit answer many diverse
+#: later questions (see ``bench_extract_gate.py``). Recommended for structured / reuse-heavy docs
+#: (policies, pricing, specs, FAQs); the prose default is better when you want a decision summary.
+EXTRACTIVE_INSTRUCTION = (
+    "IGNORE the question. EXTRACT every atomic fact the sources state, as a flat list of `claims`, "
+    "one claim per fact. For EVERY number, include the number, exactly what it measures, its unit, "
+    "and any condition or qualifier attached to it. Include every named entity, quantity, date, "
+    "limit, rate, duration, threshold, tier, price, and stated condition. Write each claim as one "
+    "short self-contained sentence naming the thing and its value. Do NOT summarize, do NOT answer a "
+    "question, do NOT omit any number or condition. Copy the values verbatim from the sources."
 )
 
 #: An instruction is either a fixed string or computed per query.
@@ -116,6 +130,7 @@ class LLMSynthesizer:
         temperature: float = 0.0,
         retries: int = 1,
         instruction: str | InstructionFn = _DEFAULT_INSTRUCTION,
+        extract: bool = True,
         fields: list[str] | None = None,
         depth: float = 0.5,
     ) -> None:
@@ -124,6 +139,11 @@ class LLMSynthesizer:
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._retries = retries
+        # extract (DEFAULT since v0.4): the QUERY-INDEPENDENT extractive instruction — one cached unit
+        # answers many later questions and keeps every number (prose loses ~40%). Selected unless the
+        # caller overrode `instruction`. Pass extract=False for the v0.3 query-grounded prose summary.
+        if extract and instruction is _DEFAULT_INSTRUCTION:
+            instruction = EXTRACTIVE_INSTRUCTION
         self._instruction = instruction
         self._fields = fields or _DEFAULT_FIELDS
         self._depth = max(0.0, min(1.0, depth))  # tunable understanding depth (cost vs gaps)
@@ -135,27 +155,45 @@ class LLMSynthesizer:
 
     def synthesize(self, query: str, chunks: list[Chunk]) -> Synthesis:
         prompt = _build_prompt(query, chunks, self._instruction_for(query), self._fields)
-        parsed = self._call(prompt)
+        parsed, usage = self._call(prompt)
         attempts = 0
         while parsed is None and attempts < self._retries:
             attempts += 1
-            parsed = self._call(prompt + "\n\nReturn STRICT JSON only.")
+            parsed, retry_usage = self._call(prompt + "\n\nReturn STRICT JSON only.")
+            usage = _add_usage(usage, retry_usage)  # retries cost real tokens too
         if parsed is None:
             # Total failure -> degrade. Never fabricate or smuggle raw text in.
-            return Synthesis(understanding={"_synthesis_failed": True}, used=[], ok=False)
+            return Synthesis(understanding={"_synthesis_failed": True}, used=[], ok=False, usage=usage)
         used = _coerce_indices(parsed.get("used"), len(chunks))
         understanding = {key: value for key, value in parsed.items() if key != "used"}
-        return Synthesis(understanding=understanding, used=used, ok=True)
+        return Synthesis(understanding=understanding, used=used, ok=True, usage=usage)
 
-    def _call(self, prompt: str) -> dict[str, Any] | None:
-        text = self._provider.generate(
+    def _call(self, prompt: str) -> tuple[dict[str, Any] | None, Usage | None]:
+        result = self._provider.generate(
             model=self._model,
             system=_SYSTEM,
             user=prompt,
             max_tokens=self._max_tokens,
             temperature=self._temperature,
         )
-        return _parse_json(text)
+        # A provider may return a bare str (no usage) or a Generation (text + usage).
+        if isinstance(result, Generation):
+            return _parse_json(result.text), result.usage
+        return _parse_json(result), None
+
+
+def _add_usage(a: Usage | None, b: Usage | None) -> Usage | None:
+    """Sum two usages (for retries). Keeps whichever model label is set."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return Usage(
+        prompt_tokens=a.prompt_tokens + b.prompt_tokens,
+        completion_tokens=a.completion_tokens + b.completion_tokens,
+        model=a.model or b.model,
+        cost=a.cost + b.cost,
+    )
 
 
 #: Sentinel distinguishing "not JSON" from a genuine JSON ``null`` (-> ``None``).

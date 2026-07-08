@@ -29,14 +29,14 @@ from .memory import (
     InMemoryRetriever,
     StubSynthesizer,
 )
-from .ports import Chunk, LLMProvider, Retriever, Synthesis, Synthesizer
+from .ports import Chunk, Generation, LLMProvider, Retriever, Synthesis, Synthesizer, Usage
 from .store import (
     CognitionStore,
     InMemoryCognitionStore,
     RedisCognitionStore,
     SQLiteCognitionStore,
 )
-from .synthesizer import JSONPassthroughSynthesizer, LLMSynthesizer
+from .synthesizer import EXTRACTIVE_INSTRUCTION, JSONPassthroughSynthesizer, LLMSynthesizer
 from .unit import Cognition
 from .vector import ChromaRetriever, PgVectorRetriever, QdrantRetriever
 
@@ -52,8 +52,11 @@ __all__ = [
     "Retriever",
     "Synthesizer",
     "Synthesis",
+    "Usage",
+    "Generation",
     "LLMProvider",
     "LLMSynthesizer",
+    "EXTRACTIVE_INSTRUCTION",
     "JSONPassthroughSynthesizer",
     "Embedder",
     "HashingEmbedder",

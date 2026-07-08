@@ -28,6 +28,32 @@ class Retriever(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class Usage:
+    """Token accounting for one LLM call — so the cache's cost AND savings are measurable
+    end-to-end (a cache HIT spends zero, which is the whole point). Surfaced on ``Result.usage``
+    and aggregated by ``SemanticCache.stats()``."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    model: str = ""
+    cost: float = 0.0           # optional USD, if the provider/caller knows prices
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+@dataclass(frozen=True, slots=True)
+class Generation:
+    """A provider response WITH usage. A provider MAY return this instead of a bare ``str``;
+    the synthesizer accepts BOTH (a plain ``str`` -> ``usage=None``), so existing and custom
+    providers never break — only the shipped OpenAI/Anthropic adapters opt into reporting usage."""
+
+    text: str
+    usage: Usage | None = None
+
+
 @dataclass(slots=True)
 class Synthesis:
     """A synthesizer's output.
@@ -36,11 +62,14 @@ class Synthesis:
     on — they become the unit's PRECISE provenance, so only sources that were
     used can invalidate it. ``ok=False`` means synthesis failed and the caller
     should degrade (keep the raw evidence) rather than cache fabricated content.
+    ``usage`` carries the token cost of the synthesis call (``None`` when no LLM
+    was called — e.g. the passthrough synthesizer or a usage-less provider).
     """
 
     understanding: dict[str, Any]
     used: list[int] = field(default_factory=list)
     ok: bool = True
+    usage: Usage | None = None
 
 
 @runtime_checkable
@@ -53,9 +82,13 @@ class Synthesizer(Protocol):
 
 @runtime_checkable
 class LLMProvider(Protocol):
-    """A text-in / text-out model (providers.{Stub,OpenAI,Anthropic}Provider)."""
+    """A text-in / text-out model (providers.{Stub,OpenAI,Anthropic}Provider).
+
+    ``generate`` may return a plain ``str`` (no usage) OR a :class:`Generation` (text + usage);
+    both are accepted, so a custom provider that returns a bare string keeps working.
+    """
 
     def generate(
         self, *, model: str, system: str, user: str, max_tokens: int, temperature: float
-    ) -> str:
+    ) -> "str | Generation":
         ...
