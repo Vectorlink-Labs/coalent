@@ -13,10 +13,11 @@
   <img alt="license" src="https://img.shields.io/badge/license-Apache%202.0-22D3EE">
   <img alt="typed" src="https://img.shields.io/badge/mypy-strict-2DD4BF">
   <img alt="tests" src="https://img.shields.io/badge/tests-passing-10B981">
+  <a href="https://discord.gg/v3hvg3nwr"><img alt="discord" src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
 </p>
 
 <p align="center">
-  <b>📖 <a href="https://coalent.ai/docs">Documentation</a></b> &nbsp;·&nbsp; <a href="https://coalent.ai">coalent.ai</a>
+  <b>📖 <a href="https://coalent.ai/docs">Documentation</a></b> &nbsp;·&nbsp; <a href="https://coalent.ai">coalent.ai</a> &nbsp;·&nbsp; <a href="https://discord.gg/v3hvg3nwr">💬 Discord</a>
 </p>
 
 <p align="center">
