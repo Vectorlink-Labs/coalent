@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ..domain.models import ChangeEvent, ProvenanceManifest, SourceSpan
+from ..domain.models import ChangeEvent, ProvenanceManifest, SourceSpan, Status
 from .embedding import (
     Embedder,
     HashingEmbedder,
@@ -28,6 +28,12 @@ from .embedding import (
 from .ports import Chunk, Retriever, Synthesizer, Usage
 from .store import CognitionStore
 from .unit import Cognition
+
+try:  # optional acceleration for pool serving at scale (``pip install coalent[fast]``).
+    # The core stays zero-dependency: every numpy path has a pure-Python twin.
+    import numpy as _np
+except ImportError:  # pragma: no cover - environment-dependent
+    _np = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +64,16 @@ class Related:
     evidence: list[Chunk]
     relation: str   # "shared_entity" | "shared_source"
     score: float    # relevance of this related unit to the current query
+
+
+# Workload presets (v0.5): named bundles of TUNED knob values — the operating points our
+# benchmarks validated — applied only to knobs the caller left unset (explicit kwargs win).
+# "multi_hop" is the bench_multihop fewest-misses point: recall_threshold 0.70 (dormant at the
+# coverage_floor default) + the bridge restart, so cross-document questions work out of the box.
+PRESETS: dict[str, dict[str, float | bool]] = {
+    "default": {},
+    "multi_hop": {"recall_threshold": 0.7, "recall_bridge": True},
+}
 
 
 @dataclass(slots=True)
@@ -164,8 +180,20 @@ class SemanticCache:
         retriever: Retriever,
         synthesizer: Synthesizer,
         *,
+        preset: str | None = None,
         embedder: Embedder | None = None,
         hit_threshold: float | None = None,
+        adaptive_hit: bool = False,
+        reuse_threshold: float = 0.9,
+        provenance_admission: bool = False,
+        widen_chunks: int | None = None,
+        source_fetcher: Callable[[str], list[Chunk]] | None = None,
+        widen_on_admission: bool | None = None,
+        split_by_artifact: bool = False,
+        serve: str = "unit",
+        serve_budget: int = 600,
+        pool_header: Callable[[Cognition], str] | None = None,
+        fast: bool | str = "auto",
         hit_margin: float = 0.0,
         coverage_floor: float | None = None,
         understanding_weight: float = 0.7,
@@ -181,6 +209,8 @@ class SemanticCache:
         recall_threshold: float | None = None,
         recall_limit: int = 6,
         recall_raw: bool = False,
+        recall_bridge: bool | None = None,   # None = off unless a preset turns it on
+        bridge_limit: int = 3,
         select_floor: float | None = None,
         residual_floor: float | None = None,
         residual_limit: int = 24,
@@ -188,7 +218,22 @@ class SemanticCache:
         store: CognitionStore | None = None,
         freshness: FreshnessPolicy | None = None,
         clock: Callable[[], float] = time.time,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
+        # Workload preset (v0.5): a named bundle of tuned knob values, applied ONLY to knobs the
+        # caller left unset — an explicit kwarg always wins. "default" is a no-op; "multi_hop"
+        # arms the validated bridge configuration (recall_threshold 0.7 + recall_bridge) so the
+        # cross-document capability fires out of the box instead of staying dormant.
+        if preset is not None:
+            if preset not in PRESETS:
+                raise ValueError(
+                    f"unknown preset {preset!r}; available: {', '.join(sorted(PRESETS))}"
+                )
+            overlay = PRESETS[preset]
+            if recall_threshold is None and "recall_threshold" in overlay:
+                recall_threshold = float(overlay["recall_threshold"])
+            if recall_bridge is None and "recall_bridge" in overlay:
+                recall_bridge = bool(overlay["recall_bridge"])
         self._retriever = retriever
         self._synth = synthesizer
         self._embedder: Embedder = embedder if embedder is not None else default_embedder()
@@ -197,6 +242,63 @@ class SemanticCache:
         # can't fit both. Override explicitly, or tune via coalent.calibrate_thresholds.
         hit_default, cov_default = default_thresholds_for(self._embedder)
         self._threshold = hit_default if hit_threshold is None else hit_threshold
+        # v0.5 — adaptive hit gate (M4 warm-up finding: match scores INFLATE as units
+        # accumulate, so a fixed threshold sinks below the noise floor and the cache
+        # 'absorbs' everything, including unanswerable queries). Self-calibrates against
+        # the cache's own cross-unit score distribution; opt-in.
+        self._adaptive_hit = adaptive_hit
+        self._noise_ceiling = 0.0
+        self._builds_since_calib = 0
+        # v0.5 gate v2 — the REUSE channel: a query whose SEED similarity to a cached unit is
+        # near-identity is the same question asked again; it must hit regardless of the noise
+        # bar (M4 replay finding: the adaptive bar killed revisits; the blend diluted the seed
+        # signal 70/30 — this reads the seed channel directly).
+        self._reuse_threshold = reuse_threshold
+        # v0.5 gate v3 — ADMISSION BY PROVENANCE (the sick-leave-paraphrase fix): before
+        # building on a low-score read, probe retrieval; if every retrieved source is already
+        # understood by cached units, building would mint a DUPLICATE understanding (the
+        # GraphRAG tax) — serve the best covering unit instead. Exact, immune to score drift.
+        self._provenance_admission = provenance_admission
+        # v0.5 — BUILD-TIME SOURCE WIDENING (the keyhole fix): when a build is already
+        # triggered by a live miss, fetch up to ``widen_chunks`` chunks OF that source
+        # (via ``source_fetcher`` or a duck-typed ``retriever.widen``) instead of settling
+        # for the few chunks the query surfaced. Replay-measured: keyhole units read a
+        # median 1 chunk of ~24 (answer-presence 0.32 vs 0.62 widened). Lazy covenant
+        # intact: widening NEVER fires at ingest, only inside a miss-triggered build.
+        self._widen_chunks = widen_chunks
+        self._source_fetcher = source_fetcher
+        self._widen_on_admission = (widen_on_admission if widen_on_admission is not None
+                                    else widen_chunks is not None)
+        self._widen_warned = False
+        # v0.5 EXPERIMENTAL preview of the v0.6 pool-first read path: serve="pool" swaps ONLY
+        # the served payload — the global fresh-claim pool ranked against the query, packed to
+        # ``serve_budget`` tokens, grouped per source unit (``pool_header`` prepends a caller-
+        # supplied title line per group). Hit/build/admission/widening/freshness are untouched.
+        # Measured basis (held-out n=605, pre-registered): pool 0.699@1036 vs the unit-anchored
+        # path 0.579@706 (McNemar z=6.66); ties naive-k9 at 0.79x its tokens (z=0.60).
+        if serve not in ("unit", "pool"):
+            raise ValueError(f"serve must be 'unit' or 'pool', got {serve!r}")
+        self._serve = serve
+        self._serve_budget = serve_budget
+        self._pool_header = pool_header
+        self._pool_state: tuple[Any, ...] | None = None   # lazy (marker, texts, unit_ids, embs)
+        # v0.5 — fast="auto": when numpy is importable the three O(cache-size) scans
+        # (_best_match / _recall_claims / _bridge_claims) run their vectorized twins —
+        # SAME control flow, matrix math instead of pure-Python cosines (equivalence is
+        # pinned by tests/test_v05_fastpath.py). "auto" = numpy present; True without
+        # numpy warns and falls back. The core stays zero-dependency either way.
+        if fast == "auto":
+            self._fast_enabled = _np is not None
+        else:
+            self._fast_enabled = bool(fast) and _np is not None
+            if fast is True and _np is None:
+                logger.warning("fast=True requested but numpy is not installed "
+                               "(pip install coalent[fast]) — using the pure-Python path")
+        self._fast_state: tuple[Any, ...] | None = None
+        # v0.5 — per-source builds (the multi-source retrieval fix): when retrieval mixes
+        # chunks from several artifacts, synthesize ONE UNIT PER ARTIFACT instead of one
+        # blended unit that keeps the dominant topic and drops the rest. Opt-in.
+        self._split_by_artifact = split_by_artifact
         # Precision guard (default 0.0 = off, v0.3 behavior): require the top unit to beat the
         # runner-up by this cosine margin before committing to it as a hit — disambiguates a query
         # sitting between topically-adjacent units (the multi-doc over-merge at compressed cosines).
@@ -223,6 +325,11 @@ class SemanticCache:
         # ~double the tokens (which would defeat the cache's whole purpose), so the default path
         # serves only compact claims+summary; flip this on only to trade tokens for accuracy.
         self._recall_raw = recall_raw
+        # v0.5 — bridge restart (the bench_multihop "(d)" arm, promoted into the library): after
+        # cross-unit recall fires, expand from the BRIDGE entity the matched unit names — serving
+        # extras only, never a coverage signal. Off unless set or armed by the multi_hop preset.
+        self._recall_bridge = bool(recall_bridge) if recall_bridge is not None else False
+        self._bridge_limit = bridge_limit
         # v0.4 — semantic-select serve: when set, serve the matched unit's atoms whose per-claim
         # cosine to the query >= select_floor (the query-RELEVANT atoms by meaning) instead of the
         # lexical keyword trim. None = the v0.3 lexical projection (backward compatible).
@@ -239,6 +346,15 @@ class SemanticCache:
         self._store = store
         self._freshness = freshness
         self._clock = clock
+        # v0.5 — freshness observability: a lightweight structured-event hook + counters, so
+        # "what did the AI know, and when was it invalidated" is visible, not just enforced.
+        # The hook must NEVER break serving: exceptions are swallowed (logged at debug).
+        self._on_event = on_event
+        self._stale_reads_prevented = 0    # reads that would have served STALE knowledge
+        self._invalidated_units = 0        # units dirtied/evicted by change events
+        self._age_serve_sum = 0.0          # age-at-serve accumulators (fresh hits only)
+        self._age_serve_max = 0.0
+        self._age_serve_n = 0
         self._units: dict[str, Cognition] = {}
         self._artifact_index: dict[str, set[str]] = {}
         self._entity_index: dict[str, set[str]] = {}
@@ -298,9 +414,61 @@ class SemanticCache:
         # runner-up by the margin. A near-tie means the query is ambiguous between adjacent units —
         # don't commit (and pollute that unit's seed); materialize the right unit instead.
         decisive = (best_score - second_score) >= self._hit_margin if second_score >= 0.0 else True
-        if best_id is not None and best_score >= self._threshold and decisive:
+        is_reuse = False
+        if best_id is not None and self._adaptive_hit:
+            cand = self._units[best_id]
+            if cand.query_embedding and cosine(qe, cand.query_embedding) >= self._reuse_threshold:
+                is_reuse = True                       # same question, cached before: always a hit
+        if (
+            self._provenance_admission
+            and not is_reuse
+            and (best_id is None or best_score < self._effective_hit_threshold() or not decisive)
+        ):
+            probe = self._retrieve(query, ns)
+            probe_ids = {c.artifact_id for c in probe if c.artifact_id}
+            all_contained = bool(probe) and all(self._chunk_contained(c) for c in probe)
+            if not all_contained and self._widen_on_admission and probe_ids:
+                # covered-but-thin sources: dirty the covering unit and ROUTE THE READ TO IT —
+                # the hit path's stale branch then widen-rebuilds it IN PLACE (same unit id,
+                # no duplicate). Self-extinguishing: fires ~once per source (96%->6% with
+                # widening on). Genuinely novel sources still fall through to MISS.
+                dirtied: set[str] = set()
+                for a in probe_ids:
+                    for uid in self._artifact_index.get(a, ()):
+                        u_ = self._units.get(uid)
+                        if u_ is not None and u_.is_fresh and not all(
+                            self._chunk_contained(c) for c in probe if c.artifact_id == a
+                        ):
+                            u_.mark_dirty()
+                            dirtied.add(uid)
+                if dirtied and all(a in self._artifact_index for a in probe_ids):
+                    best_id = max(dirtied, key=lambda uid: self._match_score(qe, self._units[uid]))
+                    best_score = self._match_score(qe, self._units[best_id])
+                    is_reuse = True
+                    self._emit("admission_widen_rebuild", unit_id=best_id,
+                               probed_sources=len(probe_ids))
+            if all_contained:
+                covering: set[str] = set()
+                for a in probe_ids:
+                    covering |= self._artifact_index[a]
+                covering = {u for u in covering
+                            if u in self._units and self._units[u].namespace == ns
+                            and self._units[u].is_fresh}
+                if covering:
+                    best_id = max(covering, key=lambda uid: self._match_score(qe, self._units[uid]))
+                    best_score = self._match_score(qe, self._units[best_id])
+                    is_reuse = True                   # duplicate build averted: hit-by-provenance
+                    self._emit("admission_reuse", unit_id=best_id, probed_sources=len(probe_ids))
+        if best_id is not None and (
+            is_reuse or (best_score >= self._effective_hit_threshold() and decisive)
+        ):
             unit = self._units[best_id]
             self._refresh_if_expired(unit)
+            # Self-heal (v0.5): a unit whose synthesis FAILED must never be served hollow —
+            # treat the hit as stale and re-materialize now (the lazy retry). Discovered in
+            # M4: transient build failures were being cached and served as empty context.
+            if unit.is_fresh and unit.understanding.get("_synthesis_failed"):
+                unit.mark_dirty()
             if unit.is_fresh:
                 # Behavioral seed: remember the query that hit (recording only in 0.3.0;
                 # in-memory like the hit counter — not yet persisted per-hit).
@@ -309,10 +477,24 @@ class SemanticCache:
                     max_queries=self._max_hit_queries,
                 )
                 cache_hit = True
+                age = max(self._clock() - unit.freshness_epoch, 0.0)
+                self._age_serve_sum += age
+                self._age_serve_max = max(self._age_serve_max, age)
+                self._age_serve_n += 1
             else:
-                # Stale (dirtied by a change or TTL) -> re-materialize THIS unit.
+                # Stale (dirtied by a change or TTL) -> re-materialize THIS unit. This is THE
+                # freshness moment: without the rebuild, this read would have served stale
+                # knowledge — counted and emitted so the prevention is visible, not silent.
+                self._stale_reads_prevented += 1
+                self._emit(
+                    "stale_read_prevented",
+                    unit_id=unit.id,
+                    query=query,
+                    unit_age_s=round(max(self._clock() - unit.freshness_epoch, 0.0), 3),
+                )
                 read_usage = self._materialize_into(unit, query, qe, ns)
                 cache_hit = False
+                self._emit("unit_rebuilt", unit_id=unit.id, reason="stale")
             confidence = best_score
         else:
             unit = self._new_unit(query, qe, ns)
@@ -320,6 +502,7 @@ class SemanticCache:
             self._units[unit.id] = unit
             cache_hit = False
             confidence = max(best_score, 0.0)
+            self._emit("unit_built", unit_id=unit.id, reason="miss")
 
         self._reads_total += 1
         if cache_hit:
@@ -341,9 +524,33 @@ class SemanticCache:
             and self._is_semantic_embedder()
             and coverage < self._effective_recall_threshold()
         ):
+            pre_recall_coverage = coverage
             recalled = self._recall_claims(qe, ns, limit=self._recall_limit)
             if recalled:
                 coverage = max(coverage, max(claim.score for claim in recalled))  # S1c
+                self._emit(
+                    "claims_recalled",
+                    unit_id=unit.id,
+                    n=len(recalled),
+                    pre_coverage=round(pre_recall_coverage, 4),
+                    post_coverage=round(coverage, 4),
+                )
+                if self._recall_bridge:
+                    # Bridge restart (v0.5, multi_hop preset): hop-2 resembles the BRIDGE entity
+                    # the matched unit names, not the question — so rank OTHER units' claims by
+                    # similarity to the matched unit's OWN claims and serve the best of them.
+                    # Serving extras ONLY: bridge scores measure bridge-similarity, so they are
+                    # deliberately kept OUT of `coverage` — the escalation gate stays honest
+                    # about what actually answers THIS query.
+                    bridged = self._bridge_claims(unit, recalled, ns)
+                    if bridged:
+                        self._emit(
+                            "bridge_claims",
+                            unit_id=unit.id,
+                            n=len(bridged),
+                            units=sorted({rc.unit_id for rc in bridged}),
+                        )
+                    recalled = recalled + bridged
 
         # S2 (opt-in) — the RELIABLE containment gate (cross-encoder / NLI / LLM entailment), consulted
         # ONLY in the ambiguous band [floor, ceiling) where cosine can't tell "adjacent" from "answers".
@@ -411,6 +618,15 @@ class SemanticCache:
         # authoritative hit signal; this is only a "you may want fresh retrieval" hint.
         needs_retrieval = coverage < self._coverage_floor
 
+        if self._serve == "pool":
+            # v0.5 preview: the decision machinery above ran unchanged; only the served
+            # payload becomes the global fresh-claim pool. Renderers read context["pool"].
+            pool_text = self._pool_context(qe)
+            if pool_text:
+                context = dict(context)
+                context["pool"] = pool_text
+                context["serve"] = "pool"
+
         return Result(
             understanding=dict(unit.understanding),
             evidence=evidence,
@@ -447,15 +663,136 @@ class SemanticCache:
         w = self._understanding_weight
         return w * topic + (1.0 - w) * seed
 
+    def _effective_hit_threshold(self) -> float:
+        """The hit bar actually applied. With ``adaptive_hit``, never below the cache's own
+        cross-unit noise ceiling — the p95 of best-match scores among units KNOWN to be about
+        different things. As the cache grows and scores inflate, the bar rises with them, so
+        a falling build rate stays a REAL signal (M4 Grid-C finding)."""
+        if not self._adaptive_hit:
+            return self._threshold
+        if self._noise_ceiling == 0.0 or self._builds_since_calib >= 16:
+            self._noise_ceiling = self._noise_floor()
+            self._builds_since_calib = 0
+        return max(self._threshold, self._noise_ceiling + 0.02)
+
+    def _noise_floor(self) -> float:
+        """p95 of cross-unit best-match scores over a fixed-seed sample of the cache's own
+        units: how high the blend runs on content that is about SOMETHING ELSE. Sampled and
+        amortized (recomputed every 16 builds), embedding-only."""
+        import random as _random
+
+        units = [u for u in self._units.values() if u.query_embedding]
+        if len(units) < 8:
+            return 0.0
+        sample = _random.Random(len(units)).sample(units, min(24, len(units)))
+        bests: list[float] = []
+        for probe in sample:
+            best = 0.0
+            for other in self._units.values():
+                if other.id == probe.id or other.namespace != probe.namespace:
+                    continue
+                best = max(best, self._match_score(probe.query_embedding, other))
+            bests.append(best)
+        bests.sort()
+        return bests[int(0.95 * (len(bests) - 1))]
+
+    # ------------------------------------------------ fast scan twin (v0.5, optional numpy)
+    def _fast_index(self) -> tuple[Any, ...] | None:
+        """Lazy q-independent structures for the vectorized scans; invalidated by the same
+        marker as the pool (unit added/removed/freshness flip). None when numpy is absent."""
+        if not self._fast_enabled or _np is None:
+            return None
+        marker = self._pool_marker()
+        state = self._fast_state
+        if state is not None and state[0] == marker:
+            return state
+        uids = list(self._units.keys())
+        dim = 0
+        for u in self._units.values():
+            for e in (u.query_embedding, u.understanding_embedding,
+                      *(u.claim_embeddings or ())):
+                if e:
+                    dim = len(e)
+                    break
+            if dim:
+                break
+        dim = dim or 1
+        def _norm(m: Any) -> Any:
+            n = _np.linalg.norm(m, axis=1, keepdims=True)
+            return m / _np.where(n > 0, n, 1.0)
+        SE = _np.zeros((len(uids), dim))
+        UE = _np.zeros((len(uids), dim))
+        spans: list[tuple[int, int]] = []            # per-unit [start, end) into the claim rows
+        has_empty: list[bool] = []                   # unit has a truthy-but-empty claim entry
+        c_rows: list[tuple[float, ...]] = []
+        c_meta: list[tuple[str, str, bool, bool, str]] = []  # (text, uid, atomic, fresh, ns)
+        for i, (uid, u) in enumerate(self._units.items()):
+            if u.query_embedding and len(u.query_embedding) == dim:
+                SE[i] = u.query_embedding
+            if u.understanding_embedding and len(u.understanding_embedding) == dim:
+                UE[i] = u.understanding_embedding
+            start = len(c_rows)
+            empty = False
+            atomic = {t for t in u.understanding.get("claims") or [] if isinstance(t, str)}
+            for text, emb in zip(self._claim_texts(u.understanding), u.claim_embeddings or ()):
+                if not emb:
+                    empty = True
+                    continue
+                c_rows.append(emb)
+                c_meta.append((str(text), uid, str(text) in atomic, u.is_fresh, u.namespace))
+            spans.append((start, len(c_rows)))
+            has_empty.append(empty)
+        CE = _norm(_np.asarray(c_rows)) if c_rows else _np.zeros((0, dim))
+        state = (marker, uids, _norm(SE), _norm(UE), spans, has_empty, CE, c_meta, dim)
+        self._fast_state = state
+        return state
+
+    def _fast_scores(self, idx: tuple[Any, ...], qe: tuple[float, ...]) -> tuple[Any, Any, Any]:
+        """(seed_sims, ue_sims, claim_sims) for one query — the only heavy math, vectorized."""
+        _, _, SE, UE, _, _, CE, _, dim = idx
+        q = _np.asarray(qe if len(qe) == dim else (0.0,) * dim, dtype=_np.float64)
+        n = _np.linalg.norm(q)
+        q = q / (n if n > 0 else 1.0)
+        return SE @ q, UE @ q, (CE @ q if CE.shape[0] else _np.zeros(0))
+
+    def _match_score_fast(self, idx: tuple[Any, ...], i: int, unit: Cognition,
+                          seed_sims: Any, ue_sims: Any, claim_sims: Any) -> float:
+        """Vectorized twin of ``_match_score`` — identical branch structure."""
+        seed = float(seed_sims[i]) if unit.query_embedding else 0.0
+        if self._route_by_claim and unit.claim_embeddings:
+            start, end = idx[4][i]
+            best = float(claim_sims[start:end].max()) if end > start else None
+            if idx[5][i]:                            # empty entries score 0.0 in the pure max
+                best = max(best, 0.0) if best is not None else 0.0
+            topic = best if best is not None else 0.0
+        elif unit.understanding_embedding:
+            topic = float(ue_sims[i])
+        else:
+            return seed
+        w = self._understanding_weight
+        return w * topic + (1.0 - w) * seed
+
     def _best_match(
         self, qe: tuple[float, ...], ns: str
     ) -> tuple[str | None, float, float]:
         """Best-matching unit in the namespace, plus the RUNNER-UP score so the caller can
         require a disambiguation margin (``hit_margin``) — the precision guard against a query
         being absorbed into a topically-adjacent neighbor when several units clear the bar."""
+        idx = self._fast_index()
         best_id: str | None = None
         best = -1.0
         second = -1.0
+        if idx is not None:
+            seed_sims, ue_sims, claim_sims = self._fast_scores(idx, qe)
+            for i, (unit_id, unit) in enumerate(self._units.items()):
+                if unit.namespace != ns:
+                    continue
+                score = self._match_score_fast(idx, i, unit, seed_sims, ue_sims, claim_sims)
+                if score > best:
+                    best, second, best_id = score, best, unit_id
+                elif score > second:
+                    second = score
+            return best_id, best, second
         for unit_id, unit in self._units.items():
             if unit.namespace != ns:
                 continue
@@ -488,10 +825,114 @@ class SemanticCache:
             chunks = list(self._relevance_gate(query, chunks))
         return chunks
 
+    def _widen_group(self, artifact_id: str, trigger: list[Chunk]) -> list[Chunk]:
+        """Fetch the SOURCE's chunks (not the query's keyhole view) for a build already in
+        flight. Merge = fetched (document order) with trigger chunks guaranteed present,
+        truncated to ``widen_chunks``. Falls back to the trigger chunks (today's behavior)
+        when no widening capability exists — never crashes, never silently substitutes."""
+        if not self._widen_chunks:
+            return trigger
+        fetched: list[Chunk] = []
+        if self._source_fetcher is not None:
+            fetched = list(self._source_fetcher(artifact_id))
+        else:
+            widen = getattr(self._retriever, "widen", None)
+            if callable(widen):
+                fetched = list(widen(artifact_id, limit=self._widen_chunks))
+            elif not self._widen_warned:
+                self._widen_warned = True
+                logger.warning("widen_chunks set but retriever has no widen() and no "
+                               "source_fetcher given — building keyhole units")
+                self._emit("widen_unavailable", artifact_id=artifact_id)
+        if not fetched:
+            return trigger
+        seen = {c.text for c in fetched}
+        merged = list(fetched) + [c for c in trigger if c.text not in seen]
+        if len(merged) > self._widen_chunks:
+            head = merged[: self._widen_chunks]
+            missing = [c for c in trigger if c.text not in {x.text for x in head}]
+            merged = (head[: self._widen_chunks - len(missing)] + missing
+                      if missing else head)
+        return merged
+
+    def _chunk_contained(self, chunk: Chunk) -> bool:
+        """CONTAINMENT predicate (v0.5 admission fix): artifact coverage is only honest if
+        this exact chunk's text is retained by a fresh covering unit. The boolean
+        artifact-index check was provenance-DISHONEST with keyhole units (96% of admission
+        hits pointed at units that had never read the probed chunk)."""
+        for uid in self._artifact_index.get(chunk.artifact_id, ()):
+            unit = self._units.get(uid)
+            if unit is not None and unit.is_fresh:
+                if any(ev.text == chunk.text for ev in unit.evidence):
+                    return True
+        return False
+
     def _materialize_into(
         self, unit: Cognition, query: str, qe: tuple[float, ...], ns: str
     ) -> Usage | None:
-        return self._build_unit(unit, query, qe, self._retrieve(query, ns))
+        chunks = self._retrieve(query, ns)
+        if not self._split_by_artifact:
+            if self._widen_chunks and chunks:
+                counts: dict[str, int] = {}
+                for c in chunks:
+                    counts[c.artifact_id] = counts.get(c.artifact_id, 0) + 1
+                dom = max(counts, key=lambda k: counts[k])
+                dom_chunks = [c for c in chunks if c.artifact_id == dom]
+                return self._build_unit(unit, query, qe, self._widen_group(dom, dom_chunks))
+            return self._build_unit(unit, query, qe, chunks)
+        groups: dict[str, list[Chunk]] = {}
+        for chunk in chunks:
+            groups.setdefault(chunk.artifact_id, []).append(chunk)
+        if len(groups) <= 1:
+            only = next(iter(groups), None)
+            built = (self._widen_group(only, chunks)
+                     if only is not None and self._widen_chunks else chunks)
+            return self._build_unit(unit, query, qe, built)
+        # One unit per SOURCE: the dominant artifact keeps this unit's identity; every other
+        # artifact gets its own sibling unit — so a mixed retrieval can never blend topics
+        # into one lossy understanding (the M4 digest/multi-source finding).
+        ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+        # never re-synthesize an already-CONTAINED source; a covered-but-thin source gets its
+        # EXISTING unit rebuilt widened (no duplicate) — the v0.5 containment semantics
+        def _group_contained(chs: list[Chunk]) -> bool:
+            return all(self._chunk_contained(c) for c in chs)
+
+        todo: list[tuple[str, list[Chunk], Cognition | None]] = []
+        for artifact_id, chs in ordered:
+            if artifact_id in self._artifact_index:
+                if _group_contained(chs):
+                    continue                          # honestly covered: skip
+                existing = next((self._units[u] for u in self._artifact_index[artifact_id]
+                                 if u in self._units and self._units[u].is_fresh), None)
+                todo.append((artifact_id, chs, existing))
+            else:
+                todo.append((artifact_id, chs, None))
+        if not todo:
+            todo = [(ordered[0][0], ordered[0][1], None)]
+        usage: Usage | None = None
+        first = True
+        for artifact_id, chs, existing in todo:
+            built_chunks = self._widen_group(artifact_id, chs)
+            if existing is not None:                  # widen-rebuild in place: no duplicate
+                self._build_unit(existing, query, qe, built_chunks)
+                self._emit("unit_rebuilt", unit_id=existing.id, reason="widen",
+                           artifact_id=artifact_id)
+                if first:
+                    first = False
+                continue
+            if first:
+                usage = self._build_unit(unit, query, qe, built_chunks)
+                first = False
+                continue
+            sibling = self._new_unit(f"{query} · {artifact_id}", qe, ns)
+            self._build_unit(sibling, query, qe, built_chunks)
+            self._units[sibling.id] = sibling
+            self._emit("unit_built", unit_id=sibling.id, reason="split",
+                       artifact_id=artifact_id)
+        if usage is None:                             # dominant was a widen-rebuild
+            usage = self._build_unit(unit, query, qe,
+                                     self._widen_group(todo[0][0], todo[0][1]))
+        return usage
 
     def _learn_from_escalation(
         self, query: str, qe: tuple[float, ...], ns: str, chunks: list[Chunk]
@@ -556,6 +997,7 @@ class SemanticCache:
                 understanding
             )
         unit.synth_tokens = synthesis.usage.total_tokens if synthesis.usage is not None else 0
+        self._builds_since_calib += 1
         unit.touch()  # a build, not a hit -> no query recorded
         self._mark_fresh(unit)
         self._reindex(unit)
@@ -646,12 +1088,14 @@ class SemanticCache:
     # ------------------------------------------------ context intelligence
     def _semantic_coverage(self, qe: tuple[float, ...], unit: Cognition) -> float:
         """How well the unit's best single claim addresses THIS query: max cosine of the
-        query against each per-claim embedding. 1.0 when there are no claims to judge by
-        (can't prove a gap — don't penalize a structured/passthrough unit). Under
-        HashingEmbedder this degrades to per-claim keyword overlap (a lexical floor);
-        with a semantic embedder it catches paraphrased gaps a lexical gate would miss."""
+        query against each per-claim embedding. With no claim embeddings the verdict
+        depends on whether there is anything SERVABLE at all: a structured/passthrough
+        unit with real content keeps the benign 1.0 ("can't prove a gap — don't
+        penalize"), but an EMPTY unit (failed synthesis: no claims, no summary) reports
+        0.0 — v0.5 fix for the M4-discovered poison where hollow units claimed perfect
+        coverage, suppressing recall AND the RAG-floor escalation, and served nothing."""
         if not unit.claim_embeddings:
-            return 1.0
+            return 1.0 if self._text_of(unit.understanding).strip() else 0.0
         return max(cosine(qe, ce) for ce in unit.claim_embeddings)
 
     def _effective_recall_threshold(self) -> float:
@@ -670,6 +1114,101 @@ class SemanticCache:
         a real embedder. Under the zero-dep HashingEmbedder, claim cosine collapses to
         lexical overlap and recall would amplify keyword coincidence, so we skip it."""
         return not isinstance(self._embedder, HashingEmbedder)
+
+    # ------------------------------------------------ pool serving (v0.5 preview of v0.6)
+    def _pool_marker(self) -> tuple[int, int]:
+        """Cheap invalidation key for the lazy pool: changes whenever a unit is added,
+        removed, or flips freshness — the three events that alter the servable pool."""
+        h = 0
+        for uid, u in self._units.items():
+            h ^= hash((uid, u.status is Status.FRESH))
+        return (len(self._units), h)
+
+    def _pool_rows(self) -> tuple[list[str], list[str], list[tuple[float, ...]]]:
+        """(claim_text, owner_unit_id, embedding) rows over FRESH units only — the
+        freshness mask is the pool's contract: a stale unit's claims never serve."""
+        texts: list[str] = []
+        owners: list[str] = []
+        embs: list[tuple[float, ...]] = []
+        for uid, u in self._units.items():
+            if u.status is not Status.FRESH:
+                continue
+            claims = u.understanding.get("claims")
+            if not isinstance(claims, list):
+                continue
+            ce = (u.claim_embeddings or ())[: len(claims)]
+            for t, e in zip(claims, ce):
+                s = (str(t.get("claim") or t.get("text") or t) if isinstance(t, dict)
+                     else str(t)).strip()
+                if s and e:
+                    texts.append(s)
+                    owners.append(uid)
+                    embs.append(tuple(e))
+        return texts, owners, embs
+
+    def _pool_context(self, qe: tuple[float, ...]) -> str:
+        """Global-pool serving: rank every fresh claim against the query, pack to
+        ``serve_budget`` (~4 chars/token estimate), group consecutive picks under their
+        owner unit with an optional caller-supplied header line. numpy when available;
+        the pure-Python twin is exact but O(pool) — fine at small caches."""
+        marker = self._pool_marker()
+        state = self._pool_state
+        if state is None or state[0] != marker:
+            texts, owners, embs = self._pool_rows()
+            matrix = None
+            if _np is not None and embs:
+                matrix = _np.asarray(embs, dtype=_np.float64)
+                matrix /= _np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9
+            state = (marker, texts, owners, embs, matrix)
+            self._pool_state = state
+        _, texts, owners, embs, matrix = state
+        if not texts:
+            return ""
+        if matrix is not None:
+            q = _np.asarray(qe, dtype=_np.float64)
+            q /= _np.linalg.norm(q) + 1e-9
+            order = [int(i) for i in _np.argsort(-(matrix @ q), kind="stable")]
+        else:
+            order = sorted(range(len(texts)), key=lambda i: -cosine(qe, embs[i]))
+        used = 0
+        picked: list[int] = []
+        for i in order:
+            used += max(1, len(texts[i]) // 4)
+            picked.append(i)
+            if used >= self._serve_budget:
+                break
+        groups: list[tuple[str, list[str]]] = []
+        cur_owner: str | None = None
+        cur: list[str] = []
+        for i in picked:
+            if owners[i] != cur_owner and cur:
+                groups.append((cur_owner or "", cur))
+                cur = []
+            cur_owner = owners[i]
+            cur.append(texts[i])
+        if cur:
+            groups.append((cur_owner or "", cur))
+        parts: list[str] = []
+        for uid, claim_group in groups:
+            head = ""
+            unit = self._units.get(uid)
+            if self._pool_header is not None and unit is not None:
+                try:
+                    head = str(self._pool_header(unit) or "")
+                except Exception:  # noqa: BLE001 — a header hook must never break serving
+                    logger.debug("pool_header raised — ignored", exc_info=True)
+            parts.append((head + "\n" if head else "") + "\n".join("- " + c for c in claim_group))
+        return "\n\n".join(parts)
+
+    def _emit(self, kind: str, **fields: Any) -> None:
+        """Deliver one structured freshness event to the ``on_event`` hook (v0.5). The hook
+        must NEVER break serving — any exception it raises is swallowed (debug-logged)."""
+        if self._on_event is None:
+            return
+        try:
+            self._on_event({"event": kind, "ts": self._clock(), **fields})
+        except Exception:  # noqa: BLE001 — observability must never take down a read
+            logger.debug("on_event hook raised for %r — ignored", kind, exc_info=True)
 
     @staticmethod
     def _with_recalled(
@@ -710,13 +1249,24 @@ class SemanticCache:
         (highest score wins). This is the cross-document, multi-hop substrate that
         single-shot top-k retrieval cannot reach — at zero extra LLM call."""
         scored: list[RecalledClaim] = []
-        for unit in self._units.values():
-            if unit.namespace != ns or not unit.is_fresh:
-                continue
-            for text, emb in zip(self._claim_texts(unit.understanding), unit.claim_embeddings):
-                if not emb or not text:
+        idx = self._fast_index()
+        if idx is not None:
+            _, _, _, _, _, _, _, c_meta, _ = idx
+            _, _, claim_sims = self._fast_scores(idx, qe)
+            for i, (text, uid, _atomic, fresh, row_ns) in enumerate(c_meta):
+                if row_ns != ns or not fresh or not text:
                     continue
-                scored.append(RecalledClaim(claim=text, score=cosine(qe, emb), unit_id=unit.id))
+                scored.append(RecalledClaim(claim=text, score=float(claim_sims[i]), unit_id=uid))
+        else:
+            for unit in self._units.values():
+                if unit.namespace != ns or not unit.is_fresh:
+                    continue
+                for text, emb in zip(self._claim_texts(unit.understanding),
+                                     unit.claim_embeddings):
+                    if not emb or not text:
+                        continue
+                    scored.append(
+                        RecalledClaim(claim=text, score=cosine(qe, emb), unit_id=unit.id))
         scored.sort(key=lambda r: r.score, reverse=True)
         out: list[RecalledClaim] = []
         seen: set[str] = set()
@@ -728,6 +1278,70 @@ class SemanticCache:
             if len(out) >= limit:
                 break
         return out
+
+    def _bridge_claims(
+        self, matched: Cognition, recalled: list[RecalledClaim], ns: str
+    ) -> list[RecalledClaim]:
+        """Bridge restart (the bench_multihop "(d)" arm, promoted into the library in v0.5).
+
+        Rank OTHER fresh units by MaxSim of their claims to the MATCHED unit's own claim
+        embeddings — expanding from the bridge entity the matched unit names, which is where
+        hop-2 lives when it does not resemble the question. Returns the single best claim of
+        each of the top ``bridge_limit`` units that are not already contributing to
+        ``recalled`` (bridge = expansion to NEW units). Pure cosine over cached embeddings,
+        zero LLM calls. NOTE: ``score`` here is bridge-similarity (cos to the matched unit's
+        claims), NOT query-similarity — callers must never feed it into coverage."""
+        seeds = [emb for emb in matched.claim_embeddings if emb]
+        if not seeds:
+            return []
+        contributing = {rc.unit_id for rc in recalled} | {matched.id}
+        seen_texts = {rc.claim for rc in recalled}
+        candidates: list[tuple[float, RecalledClaim]] = []
+        idx = self._fast_index()
+        if idx is not None:
+            _, uids, _, _, spans, _, CE, c_meta, dim = idx
+            S = _np.asarray([s for s in seeds if len(s) == dim], dtype=_np.float64)
+            if S.shape[0] and CE.shape[0]:
+                Sn = _np.linalg.norm(S, axis=1, keepdims=True)
+                S = S / _np.where(Sn > 0, Sn, 1.0)
+                bridge_sims = (CE @ S.T).max(axis=1)
+                for i, (uid, unit) in enumerate(self._units.items()):
+                    if unit.namespace != ns or not unit.is_fresh or uid in contributing:
+                        continue
+                    start, end = spans[i]
+                    best_score, best_text = 0.0, ""
+                    for j in range(start, end):
+                        text, _uid, atomic, _fresh, _ns2 = c_meta[j]
+                        if not text or not atomic or text in seen_texts:
+                            continue
+                        score = float(bridge_sims[j])
+                        if score > best_score:
+                            best_score, best_text = score, text
+                    if best_text:
+                        candidates.append(
+                            (best_score,
+                             RecalledClaim(claim=best_text, score=best_score, unit_id=uid)))
+            candidates.sort(key=lambda pair: pair[0], reverse=True)
+            return [claim for _, claim in candidates[: self._bridge_limit]]
+        for unit in self._units.values():
+            if unit.namespace != ns or not unit.is_fresh or unit.id in contributing:
+                continue
+            # The embedding pool is [claims..., residuals..., summary]; the bridge serves
+            # ATOMIC facts only — the summary would re-inflate tokens and blur provenance.
+            atomic = {t for t in unit.understanding.get("claims") or [] if isinstance(t, str)}
+            best_score, best_text = 0.0, ""
+            for text, emb in zip(self._claim_texts(unit.understanding), unit.claim_embeddings):
+                if not emb or not text or text not in atomic or text in seen_texts:
+                    continue
+                score = max(cosine(seed, emb) for seed in seeds)
+                if score > best_score:
+                    best_score, best_text = score, text
+            if best_text:
+                candidates.append(
+                    (best_score, RecalledClaim(claim=best_text, score=best_score, unit_id=unit.id))
+                )
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
+        return [claim for _, claim in candidates[: self._bridge_limit]]
 
     def _attach_recall_sources(self, query: str, recalled: list[RecalledClaim]) -> None:
         """OPT-IN (``recall_raw``, default OFF) — ground each recalled claim in the retained raw
@@ -910,6 +1524,8 @@ class SemanticCache:
                 "artifact_id your retrieval records as provenance?",
                 event.artifact_id,
             )
+            self._emit("source_changed", artifact_id=event.artifact_id,
+                       change_kind=event.kind, matched_units=0, dirtied=[], deleted=[])
             return result
         for unit_id in unit_ids:
             unit = self._units.get(unit_id)
@@ -924,6 +1540,16 @@ class SemanticCache:
                 result.dirtied.append(unit_id)
             else:
                 result.skipped_unchanged.append(unit_id)
+        self._invalidated_units += len(result.dirtied) + len(result.deleted)
+        self._emit(
+            "source_changed",
+            artifact_id=event.artifact_id,
+            change_kind=event.kind,
+            matched_units=result.matched_units,
+            dirtied=list(result.dirtied),
+            deleted=list(result.deleted),
+            skipped_unchanged=len(result.skipped_unchanged),
+        )
         return result
 
     def source_changed(
@@ -1020,6 +1646,8 @@ class SemanticCache:
         hits = self._reads_hit
         synth_tokens = self._synth_prompt_tokens + self._synth_completion_tokens
         avg_synth = synth_tokens / self._synth_calls if self._synth_calls else 0.0
+        now = self._clock()
+        fresh_ages = [max(now - u.freshness_epoch, 0.0) for u in self._units.values() if u.is_fresh]
         return {
             "units": len(self._units),
             "tracked_artifacts": len(self._artifact_index),
@@ -1028,6 +1656,14 @@ class SemanticCache:
             "escalations": self._reads_escalated,
             "escalation_rate": round(self._reads_escalated / hits, 3) if hits else 0.0,
             "hit_rate": round(hits / self._reads_total, 3) if self._reads_total else 0.0,
+            # v0.5 — freshness observability: how often the cache REFUSED to serve stale
+            # knowledge, how much got invalidated, and how old served knowledge actually is.
+            "staleness_prevented": self._stale_reads_prevented,
+            "invalidated_units": self._invalidated_units,
+            "avg_age_at_serve_s": round(self._age_serve_sum / self._age_serve_n, 3)
+            if self._age_serve_n else 0.0,
+            "max_age_at_serve_s": round(self._age_serve_max, 3),
+            "oldest_fresh_unit_s": round(max(fresh_ages), 3) if fresh_ages else 0.0,
             # Token/cost telemetry. synth_tokens = total spent building units. tokens_saved =
             # EXACT sum of each hit's unit build cost (per-unit recorded, so it survives a store
             # reload and is correct under mixed/usage-less providers — not a running-average guess).

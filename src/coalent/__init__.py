@@ -21,6 +21,7 @@ from __future__ import annotations
 
 # --- The cache (primary API) ---
 from .semantic import (
+    PRESETS,
     BaseVectorRetriever,
     Chunk,
     ChromaRetriever,
@@ -75,11 +76,12 @@ from .events import (
     verify_github_signature,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "__version__",
     # --- The cache ---
+    "PRESETS",
     "SemanticCache",
     "ContextStrategy",
     "FreshnessPolicy",

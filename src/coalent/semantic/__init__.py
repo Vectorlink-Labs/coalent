@@ -6,6 +6,7 @@ provenance-driven, skip-no-op invalidation.
 from __future__ import annotations
 
 from .cache import (
+    PRESETS,
     ContextStrategy,
     FreshnessPolicy,
     InvalidationResult,
@@ -41,6 +42,7 @@ from .unit import Cognition
 from .vector import ChromaRetriever, PgVectorRetriever, QdrantRetriever
 
 __all__ = [
+    "PRESETS",
     "SemanticCache",
     "ContextStrategy",
     "FreshnessPolicy",

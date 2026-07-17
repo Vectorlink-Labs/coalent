@@ -3,6 +3,63 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0]
+
+The pool release. v0.5 ships the results of a month-long benchmark war on real news data
+(MultiHopRAG, 609 articles, third-party gold questions): the build path now reads whole
+sources instead of retrieval keyholes, admission prevents duplicate understanding by
+provenance, the hit gate self-calibrates as the cache grows — and an experimental preview
+of the v0.6 read path serves the globally ranked claim pool instead of one routed unit.
+Every number below is pre-registered and measured on held-out questions.
+
+### Added
+- `preset="multi_hop"` — one argument arms cross-unit recall + the hop-2 bridge with
+  calibrated thresholds. Explicit kwargs always override a preset.
+- `serve="pool"` + `serve_budget` + `pool_header` (**experimental**, preview of the v0.6
+  read path): serve the token-budgeted, globally ranked fresh-claim pool instead of the
+  routed unit's claims. Measured (held-out n=605, real news): 0.699 accuracy @ ~1,040
+  context tokens vs 0.579 for the unit path (McNemar z=6.66); statistically ties naive
+  dense RAG's best measured configuration at 0.79x its tokens; 95% null honesty (vs
+  naive's 85-88%). Stale units' claims are masked from the pool the moment a source
+  changes — freshness is preserved by construction.
+- Source widening — `widen_chunks`, `source_fetcher`, `widen_on_admission`: a
+  miss-triggered build reads up to N chunks of the dominant source (duck-typed
+  `retriever.widen(artifact_id, limit=)` or your `source_fetcher`) instead of only the
+  retrieved keyhole. E2E effect: rebuild churn 460 -> 31; warm-pass accuracy flipped from
+  decaying (-0.03) to compounding (+0.04). Lazy covenant intact: never fires at ingest.
+- Provenance admission — `provenance_admission`: before paying for a build, an exact-text
+  containment probe checks whether retrieval's chunks are already inside fresh units;
+  covered reads serve without building, thin coverage widen-rebuilds in place.
+- `split_by_artifact`: one unit per source when retrieval mixes artifacts.
+- `adaptive_hit` + seed-reuse channel: the hit gate self-calibrates against cross-unit
+  score inflation as the cache grows (fixed thresholds provably absorb everything at
+  scale); repeat/paraphrase queries keep hitting via the seed channel.
+- `recall_bridge` + `bridge_limit`: hop-2 bridge restart (rank other units' claims by
+  similarity to the matched unit's own claims — where hop-2 lives when it does not
+  resemble the question). Armed by `preset="multi_hop"`.
+- `on_event` observability hook + structured freshness events (`unit_built`,
+  `unit_rebuilt`, `admission_reuse`, `admission_widen_rebuild`, `stale_read_prevented`,
+  `claims_recalled`, `bridge_claims`, `source_changed`).
+- `fast="auto"` — numpy-accelerated read path (`pip install "coalent[fast]"`): the three
+  O(cache-size) scans run as vectorized twins with identical control flow; equivalence is
+  pinned by CI tests to float precision. Auto-detects numpy; the pure-Python fallback
+  keeps the core zero-dependency.
+- `Result.needs_retrieval` hint: the cache still under-covers after recall — your answerer
+  may want fresh retrieval (an affordance, not an automatic action).
+
+### Changed
+- `select_floor` is deprecated (superseded by pool serving) and will be removed in a
+  future release.
+
+### Honesty notes
+- All additions are opt-in / default-OFF (or `auto` with proven-identical results): v0.4
+  code behaves identically on v0.5.
+- Full regime map: on the adversarial open-domain news benchmark, pool serving matches
+  naive dense RAG's best measured arm at 0.79x its tokens (statistical tie, n=605
+  pre-registered) — we do not claim to beat it there. The structured/reuse-heavy regime
+  keeps its ~0.33x parity result. Multi-hop-beyond-top-K and churn benchmarks are tracked
+  for v0.6.
+
 ## [0.4.0]
 
 Cognition units, on by default. v0.4 turns the seed query into **query-independent

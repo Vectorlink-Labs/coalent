@@ -9,6 +9,10 @@ dist/
 venv/
 env/
 
+# Benchmark artifacts / local data
+data/
+*.diff
+
 # Tooling
 .pytest_cache/
 .mypy_cache/

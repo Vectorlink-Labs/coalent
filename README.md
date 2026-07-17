@@ -22,7 +22,7 @@
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
-  <a href="#whats-new-in-v04">What's new in v0.4</a> ·
+  <a href="#whats-new-in-v05">What's new in v0.5</a> ·
   <a href="#the-read-path--a-ladder-of-gates">Gate ladder</a> ·
   <a href="#bring-your-own-stack">Bring your own stack</a> ·
   <a href="#benchmark">Benchmark</a> ·
@@ -45,7 +45,7 @@ Every context layer is forced to trade off three things. Coalent is built to hol
 
 Coalent sits **above retrieval** — bring any retriever (vector DB, hybrid search, GraphRAG, tools, APIs). It's the freshness-and-reuse layer, not another retriever — deliberately the *opposite* of GraphRAG's build-the-whole-graph-upfront tax: **lightweight, independent units, built lazily only when a query actually needs one**, and refreshed by dirtying a single unit (no graph surgery).
 
-> **New in v0.4** — extractive understanding and cross-unit recall are now **on by default** (they're strictly better on structured / reuse-heavy corpora, and free elsewhere). See [What's new](#whats-new-in-v04) and the [read-path gate ladder](#the-read-path--a-ladder-of-gates).
+> **New in v0.5** — `preset="multi_hop"`, source **widening**, provenance **admission**, a self-calibrating **adaptive** hit gate, `fast="auto"` numpy acceleration, structured **observability events**, and an experimental **pool serving** preview of the v0.6 read path (measured: statistically ties naive dense RAG's best arm at **0.79× its tokens**, pre-registered held-out n=605). All additive, all default-OFF. See [What's new](#whats-new-in-v05).
 
 ## Install
 
@@ -90,6 +90,34 @@ cache = SemanticCache(
 # Multi-hop across documents? recall is already on; raise its trigger to bridge units:
 #   SemanticCache(retriever, synth, embedder=..., recall_threshold=0.7)
 ```
+
+## What's new in v0.5
+
+The pool release — everything a month-long, pre-registered benchmark war on real news data
+(MultiHopRAG, 609 articles, third-party questions) taught us, shipped as opt-in features:
+
+- **`preset="multi_hop"`** — one argument arms cross-unit recall + the hop-2 bridge with
+  calibrated thresholds. Explicit kwargs always win.
+- **Source widening** (`widen_chunks=24`) — a miss-triggered build reads up to N chunks of the
+  dominant source instead of only the retrieved keyhole. Effect in E2E: rebuild churn 460 → 31,
+  warm-pass accuracy flipped from decaying to compounding. Never fires at ingest.
+- **Provenance admission** (`provenance_admission=True`) — an exact-text containment probe
+  prevents duplicate understanding: covered reads serve without building; thin coverage
+  widen-rebuilds in place.
+- **Adaptive hit gate** (`adaptive_hit=True`) — self-calibrates against score inflation as the
+  cache grows (fixed thresholds provably absorb everything at scale).
+- **Pool serving preview** (`serve="pool"`, `serve_budget=600`, `pool_header=...`) — serve the
+  token-budgeted, globally ranked fresh-claim pool instead of one routed unit (**experimental**;
+  the v0.6 read path). Held-out n=605: 0.699 accuracy vs 0.579 for unit serving (z=6.66);
+  statistically ties naive dense RAG's best measured arm at 0.79× its tokens; 95% null honesty.
+  Stale units' claims are masked from the pool the moment a source changes.
+- **`fast="auto"`** — numpy-accelerated read path when numpy is present
+  (`pip install "coalent[fast]"`); results are equivalence-pinned to the pure-Python core.
+- **Observability** (`on_event=...`) — structured freshness events: builds, rebuilds, admission
+  reuse, stale reads prevented, recall and bridge activity.
+- Deprecated: `select_floor` (superseded by pool serving).
+
+Full numbers and method in the [benchmark](#benchmark) section and CHANGELOG.
 
 ## What's new in v0.4
 
@@ -207,6 +235,26 @@ tools = build_mcp_tools(cache)        # expose the cache as an MCP tool
 ```
 
 ## Benchmark
+
+### Real-world: MultiHopRAG (v0.5, pre-registered)
+
+609 real news articles, third-party gold questions, answered by gpt-4.1-mini with exact-match
+grading — the corpus **maximally friendly to chunk retrieval** (questions are generated from
+article sentences), chosen as the adversarial test. We run the fairness control most benchmarks
+skip: **naive's own token-scaling curve** on the same stream (k4 0.58 @ 590 tok · k6 0.64 @ 882 ·
+k9 0.71 @ 1311, n=605 held-out).
+
+- **Pool serving (`serve="pool"`, warmed cache): 0.699 @ ~1,036 tokens** — beats naive k6
+  (paired McNemar z=3.22) and **statistically ties naive's best measured arm at 0.79× its
+  tokens** (z=0.60). We do not claim to beat the curve here; the claim is match-at-fewer-tokens
+  plus what retrieval alone cannot do (freshness, provenance, compounding reuse).
+- **Null honesty** (n=100 unanswerable): pool **95%** refusal vs naive's 85–88%.
+- **Build layer** (cold-start, on-the-fly): widened units read a median **23 chunks** of their
+  source vs 2 for keyhole builds; rebuild churn **460 → 31**; warm-pass accuracy flipped from
+  decaying (−0.03) to compounding (+0.04).
+- Misattribution 2–6%; cross-unit recall fired on ~90% of reads (fully instrumented).
+
+### Structured regime (synthetic templates, v0.4)
 
 Measured honestly on the structured / reuse workload Coalent is built for — **64 sources × 3 seeds = 192 reads per condition**, real OpenAI embeddings, a **deterministic** number-and-attribute accuracy check (no LLM-judge self-preference), and a **real dense top-5 retriever shared by both arms** (the naive RAG baseline *is* that retriever). Accuracy is graded escalation-off, so a fallback can't launder a win.
 
