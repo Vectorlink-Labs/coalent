@@ -102,3 +102,30 @@ def test_serve_param_validated() -> None:
         assert "serve" in str(e)
     else:  # pragma: no cover
         raise AssertionError("invalid serve value must raise")
+
+
+def test_pool_is_namespace_isolated() -> None:              # 0.5.1 fix (D1)
+    retriever = InMemoryRetriever()
+    cache = SemanticCache(retriever, _Synth(), embedder=FunctionEmbedder(_embed),
+                          hit_threshold=0.30, coverage_floor=0.0, serve="pool")
+    retriever.add("src:alpha", "alpha fact")
+    retriever.add("src:beta", "beta fact")
+    cache.get("common alpha", namespace="team-a")
+    cache.get("common beta", namespace="team-b")
+    r = cache.get("common alpha", namespace="team-a")
+    pool = r.context.get("pool", "")
+    assert "alpha" in pool
+    assert "beta" not in pool                               # team-b's claims never leak
+
+
+def test_containment_ns_scoped_both_modes() -> None:        # 0.5.1 fix (D3)
+    retriever = InMemoryRetriever()
+    cache = SemanticCache(retriever, _Synth(), embedder=FunctionEmbedder(_embed),
+                          hit_threshold=0.30, coverage_floor=0.0,
+                          provenance_admission=True)
+    retriever.add("src:alpha", "alpha fact")
+    cache.get("common alpha", namespace="team-a")           # team-a understands src:alpha
+    n = len(cache._units)
+    r = cache.get("target alpha", namespace="team-b")       # team-b must BUILD its own
+    assert r.cache_hit is False
+    assert len(cache._units) == n + 1                       # foreign unit didn't suppress it

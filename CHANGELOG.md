@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1]
+
+Namespace-isolation fixes for two v0.5 features, found by the v0.6 design review's
+adversarial pass and confirmed in code:
+
+### Fixed
+- `serve="pool"` now filters the claim pool by namespace — one namespace's claims can no
+  longer be served into another namespace's context (isolation bug in the experimental
+  pool preview; single-namespace users were unaffected).
+- `provenance_admission` containment is now namespace-scoped — a unit in a foreign
+  namespace can no longer suppress a legitimate build in yours.
+
+Both pinned by new tests (`test_pool_is_namespace_isolated`,
+`test_containment_ns_scoped_both_modes`).
+
 ## [0.5.0]
 
 The pool release. v0.5 ships the results of a month-long benchmark war on real news data

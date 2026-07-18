@@ -426,7 +426,7 @@ class SemanticCache:
         ):
             probe = self._retrieve(query, ns)
             probe_ids = {c.artifact_id for c in probe if c.artifact_id}
-            all_contained = bool(probe) and all(self._chunk_contained(c) for c in probe)
+            all_contained = bool(probe) and all(self._chunk_contained(c, ns) for c in probe)
             if not all_contained and self._widen_on_admission and probe_ids:
                 # covered-but-thin sources: dirty the covering unit and ROUTE THE READ TO IT —
                 # the hit path's stale branch then widen-rebuilds it IN PLACE (same unit id,
@@ -437,7 +437,7 @@ class SemanticCache:
                     for uid in self._artifact_index.get(a, ()):
                         u_ = self._units.get(uid)
                         if u_ is not None and u_.is_fresh and not all(
-                            self._chunk_contained(c) for c in probe if c.artifact_id == a
+                            self._chunk_contained(c, ns) for c in probe if c.artifact_id == a
                         ):
                             u_.mark_dirty()
                             dirtied.add(uid)
@@ -621,7 +621,7 @@ class SemanticCache:
         if self._serve == "pool":
             # v0.5 preview: the decision machinery above ran unchanged; only the served
             # payload becomes the global fresh-claim pool. Renderers read context["pool"].
-            pool_text = self._pool_context(qe)
+            pool_text = self._pool_context(qe, ns)
             if pool_text:
                 context = dict(context)
                 context["pool"] = pool_text
@@ -855,14 +855,14 @@ class SemanticCache:
                       if missing else head)
         return merged
 
-    def _chunk_contained(self, chunk: Chunk) -> bool:
+    def _chunk_contained(self, chunk: Chunk, ns: str = "") -> bool:
         """CONTAINMENT predicate (v0.5 admission fix): artifact coverage is only honest if
         this exact chunk's text is retained by a fresh covering unit. The boolean
         artifact-index check was provenance-DISHONEST with keyhole units (96% of admission
         hits pointed at units that had never read the probed chunk)."""
         for uid in self._artifact_index.get(chunk.artifact_id, ()):
             unit = self._units.get(uid)
-            if unit is not None and unit.is_fresh:
+            if unit is not None and unit.is_fresh and unit.namespace == ns:
                 if any(ev.text == chunk.text for ev in unit.evidence):
                     return True
         return False
@@ -895,7 +895,7 @@ class SemanticCache:
         # never re-synthesize an already-CONTAINED source; a covered-but-thin source gets its
         # EXISTING unit rebuilt widened (no duplicate) — the v0.5 containment semantics
         def _group_contained(chs: list[Chunk]) -> bool:
-            return all(self._chunk_contained(c) for c in chs)
+            return all(self._chunk_contained(c, ns) for c in chs)
 
         todo: list[tuple[str, list[Chunk], Cognition | None]] = []
         for artifact_id, chs in ordered:
@@ -1124,14 +1124,15 @@ class SemanticCache:
             h ^= hash((uid, u.status is Status.FRESH))
         return (len(self._units), h)
 
-    def _pool_rows(self) -> tuple[list[str], list[str], list[tuple[float, ...]]]:
-        """(claim_text, owner_unit_id, embedding) rows over FRESH units only — the
-        freshness mask is the pool's contract: a stale unit's claims never serve."""
+    def _pool_rows(self, ns: str) -> tuple[list[str], list[str], list[tuple[float, ...]]]:
+        """(claim_text, owner_unit_id, embedding) rows over FRESH units in ``ns`` only —
+        freshness AND namespace isolation are the pool's contract: a stale unit's claims
+        never serve, and a namespace never sees another namespace's claims (0.5.1 fix)."""
         texts: list[str] = []
         owners: list[str] = []
         embs: list[tuple[float, ...]] = []
         for uid, u in self._units.items():
-            if u.status is not Status.FRESH:
+            if u.status is not Status.FRESH or u.namespace != ns:
                 continue
             claims = u.understanding.get("claims")
             if not isinstance(claims, list):
@@ -1146,15 +1147,15 @@ class SemanticCache:
                     embs.append(tuple(e))
         return texts, owners, embs
 
-    def _pool_context(self, qe: tuple[float, ...]) -> str:
+    def _pool_context(self, qe: tuple[float, ...], ns: str = "") -> str:
         """Global-pool serving: rank every fresh claim against the query, pack to
         ``serve_budget`` (~4 chars/token estimate), group consecutive picks under their
         owner unit with an optional caller-supplied header line. numpy when available;
         the pure-Python twin is exact but O(pool) — fine at small caches."""
-        marker = self._pool_marker()
+        marker = (ns, *self._pool_marker())
         state = self._pool_state
         if state is None or state[0] != marker:
-            texts, owners, embs = self._pool_rows()
+            texts, owners, embs = self._pool_rows(ns)
             matrix = None
             if _np is not None and embs:
                 matrix = _np.asarray(embs, dtype=_np.float64)
