@@ -3,6 +3,172 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0]
+
+v0.6 adds the claim-pool-first read path (`read_path="pool"`) and a default-OFF behavioral
+stack (residual spans, refusal fallback, append-only repair, query keys). The default read
+path is unchanged: a v0.5 user who upgrades and touches nothing gets v0.5 behavior, modulo
+the bugfixes listed under Fixed. The pool path is opt-in in 0.6; the default flip is a
+v0.7 decision gated by the pre-registered criteria at the bottom of this entry.
+
+Benchmark rig for every n=605 number below: a 609-article news corpus with 605 frozen
+held-out questions, gpt-4.1-mini answerer, strict grading (normalized gold containment) —
+the same rig every anchor since v0.5 was measured on.
+
+### Known limits (read this first)
+
+These are measured properties of the release, not edge cases:
+
+- **The pool payload can only attribute what the unit knows.** The shipping default header
+  is built from the unit's build query (`## {query[:60]}`). It measured 0.6777 strict
+  accuracy on the n=605 news benchmark versus 0.7306 for a caller-supplied metadata header
+  (`[title | source | date]`). The gap is a **unit-metadata limit, not a header-format
+  problem**: outlet and date live only in corpus metadata, nowhere on the `Cognition` unit,
+  so per-outlet questions the payload cannot attribute are refused — correctly. Wire
+  `pool_header` to your own metadata (recipe in UPGRADE-0.5-to-0.6.md) to recover the
+  difference. An optional ingest-time metadata field is a v0.7 item.
+- **The refusal fallback flips fewer refusals on natural tails than on lab questions.**
+  On the benchmark's 91 natural first-pass refusals, 18 flipped to strict-correct (~20%
+  unconditional); restricted to the 27 refusals whose fallback payload actually contained
+  the gold string, 9 flipped (33%). The 68% figure from the hardening lab holds only for
+  span-derived questions where the payload always contains the answer.
+- **Query keys can collide across sibling articles in dense same-topic corpora.** Observed
+  3 reads in 605 where one article's key fired on sibling-article queries (answers were
+  still correct in all 3). If your corpus is many near-identical articles on one topic,
+  consider raising `key_floor` above its 0.85 default.
+- **Keys do not raise final accuracy on diverse rewordings.** Their measured value there
+  is converting refusal round-trips into first-pass answers (first-pass 7%→33%, fallback
+  retries −70%, final accuracy unchanged in a same-population 3-arm cell). On mild
+  paraphrases they fire 90% and give 70% first-pass.
+
+### Added
+
+- **`read_path="pool"` — the claim-pool-first read path (opt-in, default-capable).**
+  Every read is answered by budget-packing the global fresh-claim pool; units remain the
+  ownership / freshness / build / provenance skeleton. Validated at n=605 on the frozen
+  news benchmark: **0.7306 strict accuracy @ 981 mean tokens** (v0.5 anchor 0.699@1036,
+  CIs overlap — the point holds), gold-rank p50/p75/p90 = 1/6/15 in pool order over
+  claim-present queries, zero regressions on every printed column across the default legs.
+  "Default-capable" means: the shipping default constructor passed the full replay gate and
+  the n=605 benchmark with no knob tuning; it still ships opt-in per the deprecation
+  timeline.
+- **Adaptive serve gate (`serve_gate=None`).** An explicit float is absolute (adaptation
+  disabled — the reproducible-bench off-ramp); `None` adapts against the pool's own
+  null-shaped noise ceiling, clamped at `cov_default + 0.27`. Shipped only after the
+  replay gate passed: warmed 609-unit store + 605 frozen queries through the shipping
+  default constructor, **605/605 serve decisions on both arms**, zero builds, zero LLM
+  spend (enforced by a poisoned synthesizer), packed-payload gold presence within noise of
+  the measured 0.699 rig (0.4331 [0.394, 0.473] vs rig 0.4215 [0.383, 0.461]), 981 vs 970
+  mean tokens. Exactly 1 of 605 reads sat in the adaptive gate band.
+- **Default pool header (attribution by default).** `pool_header=None` no longer serves an
+  unattributed payload. The built-in default renders `## {unit.query[:60]}` per source
+  group (the build query carries source-identifying text), falling back to
+  `[source: {artifact_id}]` for units with no query text. The measured three-point ladder
+  on the same frozen store/queries/grader (n=605, strict): opaque id **0.6413** (153
+  refusals) → query-title default **0.6777** (136 refusals; **this ships**) → caller
+  metadata callable `[title | source | date]` **0.7306** (101 refusals; **documented best
+  recipe**). See Known limits for why the remaining gap is a unit-metadata limit.
+- **Behavioral stack (all default-OFF; nothing below runs unless switched on):**
+  - `residual_spans=True` — build-time sentence audit retains fact-bearing source
+    sentences the extractor missed (hard-fact test + max-claim-cosine < `span_tau`,
+    capped per unit) as tier-2 spans **on the unit, never in the pool** (zero pool
+    crowding). At read time a span outranking every fresh claim by `span_margin` serves
+    as a labeled side channel inside the same `serve_budget`.
+  - **Refusal fallback** — every read gets a deterministic `Result.read_id` (64-read ring
+    buffer). When *your* answerer refuses over a served payload, call
+    `report_refusal(read_id)`: the cache re-scores the namespace's residual spans against
+    the original query embedding and returns an attributed retry payload (up to 2 spans,
+    floor `span_serve_floor=0.35`), or `None`. `report_success(read_id)` is the symmetric
+    confirm half. On the n=605 benchmark this machinery delivered a payload on **91/91**
+    first-pass refusals and cut net refusals **91 → 61 (−33%)** with zero newly-wrong
+    answers.
+  - **Append-only repair** — span serves and raw-fallback escalations count toward
+    `lossy_threshold` (default 2); a lossy-marked unit repairs on its next rebuild touch
+    by *appending* the missing facts (claims are never dropped while the source hash is
+    unchanged; replace only on a changed hash). Spans self-retire on recapture.
+  - `query_keys=True` (requires `residual_spans` machinery and the pool path) — a
+    fallback-rescued read attaches the successful span as a provisional alternate key on
+    its unit; `report_success` confirms it durable (serde-persisted). At read time a
+    confirmed key scores `max(content_sim, key_sim)` and counts **only at/above
+    `key_floor=0.85`**. Compounding probe on the same benchmark: keyed-class first-pass
+    accuracy **0% → 61%** on mild paraphrases (11/18), controls untouched (fired 60% vs
+    not-fired 58% correct, n=100).
+- **Serving hardening (measured findings, all shipped):**
+  - **Default attribution on every payload surface**: the pool payload (default header
+    above) and the escalation raw floor both carry source attribution; an unattributed
+    payload made per-source questions unanswerable by construction.
+  - **Within-owner-only near-dup collapse**: stage-1 dedup collapses a unit's *own*
+    rephrasings only. Cross-owner near-duplicates — even exact text — are corroboration,
+    and per-source questions need the owner's own attributed copy, so they all survive.
+  - **Attributed escalation raw**: raw chunks served by the coverage floor are prefixed
+    `[source: {artifact_id}]` in the same format as the pool header.
+- **New events:** `pool_gate`, `pool_served`, `pool_masked_stale`, `pool_budget_overrun`,
+  `rerank_failed`, `rebuild_triggered_by_read`, `build_triggered_by_gap`,
+  `unit_marked_lossy`, `unit_repaired`, `residual_served`, `residual_fallback`,
+  `key_attached`, `key_confirmed`, `key_fired`. Retained unchanged: `source_changed`,
+  `unit_built`, `unit_rebuilt`, `stale_read_prevented`, `admission_reuse`,
+  `widen_unavailable`.
+- **`Result.read_id`** — deterministic per-read id; the handle for `report_refusal` /
+  `report_success`.
+- **Constructor guards:** `query_keys=True` with `read_path != "pool"` raises
+  `ValueError("query_keys requires read_path='pool'")` at construction. On the unit path,
+  keys could attach and confirm yet structurally never fire — a silent-failure class we
+  fail loud on instead. Likewise `read_path="pool"` with a `HashingEmbedder` raises at
+  construction (claim cosine collapses to keyword overlap; the error names the escape
+  hatches).
+- **`reranker` hook** (`Callable[[str, list[str]], list[float]] | None = None`) — serving
+  order only; the serve/build/floor decisions always read the pre-rerank cosine, so a bad
+  reranker can degrade order but never cause a false serve, a skipped build, or a broken
+  null refusal. `None` is the default for all of 0.x; no preset sets it.
+- **`claim_index` protocol** — BYO pool storage (`ClaimIndex`; built-in numpy/pure-python
+  implementations, per-namespace factory form supported).
+
+### Changed
+
+- **`serve_budget` default split:** `None` → 600 on the unit path (v0.5 preserved) and
+  1000 on the pool path (reproduces the measured ~1036-token operating point under strict
+  header-counting packing). Explicit values always win; `<= 0` raises.
+- **Result contract on the pool path** (unit path untouched):
+  `understanding = {"claims": [...]}` with no `summary` key; `unit_id` = owner of the
+  top-ranked served claim; `confidence` = pre-decision pool coverage (what the gate read);
+  `coverage` = final post-build/post-S2; `evidence = []` on a non-escalated serve
+  (citations via `drill(unit_id)`); `recalled = []` (unit-path field, kept one version);
+  `pool` = served claims in served order. `cache_hit` on the pool path means zero
+  synthesis calls ran this read.
+- **`stats()` pool additions:** `pool_serves`, `probe_reads`, `admission_reuses`,
+  `retrievals`, `rebuilds_by_read`, `builds_by_gap`, `serve_gate_effective`,
+  `pool_noise_ceiling`, `pool_claims_fresh`, `pool_claims_total`, `avg_units_per_serve`,
+  `pool_scan_slow` — gate miscalibration is a dashboard number, not a silent
+  duplicate-build tax.
+
+### Fixed
+
+- **v0.5 pool-preview stale-serve hole.** The preview's `(len, xor-hash)` pool marker
+  could return to its prior value after an in-place rebuild within one read (dirty →
+  rebuild → fresh, same id, same claim count), serving the old claim texts. Replaced by
+  two monotone counters (`_rows_epoch` bumped on any row change, `_status_gen` on any
+  freshness flip); a same-size rebuild can no longer restore a prior marker value.
+
+### Deprecated
+
+- `serve="pool"` (the v0.5 experimental preview): preserved verbatim in 0.6, never
+  auto-mapped to `read_path="pool"`; removal scheduled v0.7. The 12 unit-path read knobs
+  (`hit_threshold`, `hit_margin`, `route_by_claim`, `recall_*`, `select_floor`, ...) are
+  inert on the pool path and keep full function on the default path; DeprecationWarning
+  v0.7, removal v0.8, minimum-notice floor 3 months after the v0.7 flip ships.
+
+### v0.7 flip gates (pre-registered)
+
+The default flips from `read_path="unit"` to `read_path="pool"` in v0.7 ONLY if all hold:
+
+> (a) the structured template suite: pool ≥ unit at equal budgets; (b) the FRAMES
+> benchmark complete with pool ≥ token-matched naive; (c) churn soak green; (d) the
+> 100-question unanswerable (null) suite ≥93% refusal under the adaptive gate; (e) the
+> replay gate holds on the shipping default constructor.
+
+Status at 0.6.0: (e) passed (605/605 both arms, this release); (a)–(d) are open v0.7 work
+and are not claimed here.
+
 ## [0.5.1]
 
 Namespace-isolation fixes for two v0.5 features, found by the v0.6 design review's

@@ -30,6 +30,7 @@ from .memory import (
     InMemoryRetriever,
     StubSynthesizer,
 )
+from .pool import ClaimIndex, ClaimRef, LocalClaimIndex
 from .ports import Chunk, Generation, LLMProvider, Retriever, Synthesis, Synthesizer, Usage
 from .store import (
     CognitionStore,
@@ -38,7 +39,7 @@ from .store import (
     SQLiteCognitionStore,
 )
 from .synthesizer import EXTRACTIVE_INSTRUCTION, JSONPassthroughSynthesizer, LLMSynthesizer
-from .unit import Cognition
+from .unit import Cognition, QueryKey, ResidualSpan
 from .vector import ChromaRetriever, PgVectorRetriever, QdrantRetriever
 
 __all__ = [
@@ -50,6 +51,11 @@ __all__ = [
     "Related",
     "InvalidationResult",
     "Cognition",
+    "QueryKey",
+    "ResidualSpan",
+    "ClaimIndex",
+    "ClaimRef",
+    "LocalClaimIndex",
     "Chunk",
     "Retriever",
     "Synthesizer",

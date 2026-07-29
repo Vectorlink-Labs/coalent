@@ -12,7 +12,7 @@ from typing import Any
 
 from ..domain.models import ProvenanceManifest, SourceSpan, Status
 from .ports import Chunk
-from .unit import Cognition
+from .unit import Cognition, QueryKey, ResidualSpan
 
 
 def _chunk_to_dict(chunk: Chunk) -> dict[str, Any]:
@@ -69,8 +69,27 @@ def _manifest_from_dict(data: dict[str, Any]) -> ProvenanceManifest:
     )
 
 
-def cognition_to_dict(unit: Cognition) -> dict[str, Any]:
+def _residual_span_to_dict(span: ResidualSpan) -> dict[str, Any]:
+    # Deliberately NO embedding: it is regenerable (~30KB of JSON per span otherwise) —
+    # the cache re-embeds loaded spans in one batch on first side-channel use.
     return {
+        "text": span.text,
+        "artifact_id": span.artifact_id,
+        "chunk_idx": span.chunk_idx,
+    }
+
+
+def _residual_span_from_dict(data: dict[str, Any]) -> ResidualSpan:
+    return ResidualSpan(
+        text=data["text"],
+        artifact_id=data.get("artifact_id", ""),
+        chunk_idx=int(data.get("chunk_idx", -1)),
+        embedding=tuple(float(x) for x in data.get("embedding", [])),
+    )
+
+
+def cognition_to_dict(unit: Cognition) -> dict[str, Any]:
+    payload = {
         "id": unit.id,
         "namespace": unit.namespace,
         "query": unit.query,
@@ -89,6 +108,25 @@ def cognition_to_dict(unit: Cognition) -> dict[str, Any]:
         "created_at": unit.created_at,
         "last_access": unit.last_access,
     }
+    # v0.6 tier-2 residual spans — written ONLY when set, so a cache that never opted in
+    # keeps emitting byte-identical v0.5 JSON (and any v0.5 reader ignores unknown keys).
+    if unit.residual_spans:
+        payload["residual_spans"] = [_residual_span_to_dict(s) for s in unit.residual_spans]
+    if unit.span_hits:
+        payload["span_hits"] = unit.span_hits
+    if unit.lossy:
+        payload["lossy"] = True
+    # v0.6 query keys: CONFIRMED keys only (provisional ones expire with the in-process read
+    # ring — never durable). Keys carry no text, so the embedding IS the key and must be
+    # persisted (float-tuple style, capped at 8/unit by the cache — the size tradeoff).
+    confirmed = [k for k in unit.query_keys if not k.read_id]
+    if confirmed:
+        payload["query_keys"] = [
+            {"embedding": list(k.embedding), "claim_idx": k.claim_idx,
+             "span_text": k.span_text, "hits": k.hits}
+            for k in confirmed
+        ]
+    return payload
 
 
 def cognition_from_dict(data: dict[str, Any]) -> Cognition:
@@ -107,6 +145,21 @@ def cognition_from_dict(data: dict[str, Any]) -> Cognition:
         ),
         synth_tokens=int(data.get("synth_tokens", 0)),  # absent in pre-v0.4 JSON -> 0
         hit_queries=tuple(str(q) for q in data.get("hit_queries", [])),
+        # v0.6 — absent in pre-v0.6 JSON: no spans, no lossy state (old dicts load fine).
+        residual_spans=tuple(
+            _residual_span_from_dict(s) for s in data.get("residual_spans", [])
+        ),
+        span_hits=int(data.get("span_hits", 0)),
+        lossy=bool(data.get("lossy", False)),
+        query_keys=tuple(
+            QueryKey(
+                embedding=tuple(float(x) for x in k.get("embedding", [])),
+                claim_idx=int(k.get("claim_idx", -1)),
+                span_text=str(k.get("span_text", "")),
+                hits=int(k.get("hits", 0)),
+            )
+            for k in data.get("query_keys", [])
+        ),
         status=Status(data.get("status", "fresh")),
         freshness_epoch=data.get("freshness_epoch", 0.0),
         hits=data.get("hits", 0),

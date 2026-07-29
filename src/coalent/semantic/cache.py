@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -25,9 +27,10 @@ from .embedding import (
     embed_texts,
     tokenize,
 )
+from .pool import ClaimIndex, ClaimRef, LocalClaimIndex
 from .ports import Chunk, Retriever, Synthesizer, Usage
 from .store import CognitionStore
-from .unit import Cognition
+from .unit import Cognition, QueryKey, ResidualSpan
 
 try:  # optional acceleration for pool serving at scale (``pip install coalent[fast]``).
     # The core stays zero-dependency: every numpy path has a pure-Python twin.
@@ -39,6 +42,45 @@ logger = logging.getLogger(__name__)
 
 _NUM = re.compile(r"\d")
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+# v0.6 tier-2 residual spans — the build-time sentence-coverage audit's filters. A sentence is
+# FACT-BEARING when it carries a number or a multi-word capitalized name; boilerplate (privacy/
+# cookie/subscribe chrome, liveblog clock-stamp lines) is excluded even when number-bearing.
+_SPAN_NAME = re.compile(r"\b[A-Z][\w&.'-]*(?:\s+[A-Z][\w&.'-]*)+")
+_SPAN_BOILERPLATE = re.compile(
+    r"(?i)privacy (?:policy|notice)|cookies?\b|subscri|newsletter|sign (?:up|in)\b|"
+    r"log ?in\b|all rights reserved|terms of (?:service|use)"
+    r"|^\s*\d{1,2}[:.]\d{2}\s*(?:a\.?m\.?|p\.?m\.?|[A-Z]{2,4}\b)"
+)
+_SPAN_MIN_WORDS = 6            # shorter fragments are headers/captions, not fact sentences
+_SPAN_DEDUP_SIM = 0.95         # within-unit near-dup bar for the append-only repair merge
+_SPANS_PER_READ = 2            # side-channel cap: at most 2 residual spans served per read
+_SPAN_CAP = 12                 # stored spans per unit, most-clearly-uncovered kept first
+_SPAN_LABEL = "[source excerpt]"
+_READ_LOG_CAP = 64             # ring buffer of recent reads report_refusal() can look up
+_MAX_KEYS_PER_UNIT = 8         # query-key cap per unit (evicts the lowest-hits existing key)
+# The HARD facts a candidate span must add over the claims (eyeball-audit fix: ~50% of raw
+# captures were 0.55-0.61 phrasing gaps — the sentence was covered by a REPHRASED claim).
+_HARD_NUM = re.compile(r"\b\d[\d,.]*%?\b")
+# A stranded <=3-char token before a blank line ("ET\n\nPotential Super Bowl...") — the
+# sentence splitter's orphan; stripped before filtering.
+_SPAN_ORPHAN = re.compile(r"^\S{1,3}\s*\n\s*\n\s*")
+
+# v0.6 pool read path — module CONSTANTS, deliberately not knobs (spec §2.2): the pool
+# path's whole point is deleting tunables, so operating points live here, test-pinned.
+_POOL_STAGE1_RAW = 600            # cosine candidates scanned before dedup
+_POOL_STAGE1_WIDTH = 400          # unique candidates after dedup = the rerank window
+_POOL_DEDUP_SIM = 0.95            # near-dup cosine threshold (numpy path only)
+_MAX_BUILDS_PER_READ = 3          # synthesis ops (rebuilds + new builds) per read
+_MAX_TTL_REVALIDATIONS_PER_READ = 3   # revalidator-backed TTL refreshes per read
+_POOL_GATE_MARGIN = 0.02
+_POOL_GATE_CEILING_MARGIN = 0.27  # adaptive gate ceiling = cov_default + 0.27
+_PUREPY_POOL_WARN_ROWS = 2000     # pure-python pool scan warning threshold
+
+
+def _est_tokens(s: str) -> int:
+    """The serving token estimate (~4 chars/token), never zero — the ONE estimator the
+    packing contract, the TTL candidate head, and the RAG-floor cap all share."""
+    return max(1, len(s) // 4)
 
 
 def _number_sentences(chunks: list[Chunk]) -> list[str]:
@@ -89,6 +131,17 @@ class RecalledClaim:
 
 
 @dataclass(slots=True)
+class _PoolHit:
+    """One pool-serving candidate row (v0.6 internal): the pre-rerank query cosine —
+    which every gate decision reads — plus the exact owner row it came from."""
+
+    score: float          # cosine(query, claim) — ALWAYS the pre-rerank score
+    unit_id: str
+    claim_idx: int        # position in the owner's claim list at add time
+    text: str
+
+
+@dataclass(slots=True)
 class Result:
     """What a read returns: understanding + retained raw evidence + related units."""
 
@@ -103,9 +156,15 @@ class Result:
     coverage: float = 1.0                                   # how well the unit covers the query
     escalated: bool = False                                 # had to pull fresh raw for this query
     recalled: list[RecalledClaim] = field(default_factory=list)  # v0.4 cross-unit atomic claims
+    pool: list[RecalledClaim] = field(default_factory=list)  # v0.6 pool path: served claims in
+    #                             served order; score is ALWAYS the query cosine (never a rerank
+    #                             score); unit_id is the owning unit. Empty on the unit path.
     usage: Usage | None = None  # synth tokens for THIS read; None when no LLM ran (a hit, OR a
     #                             usage-less provider) — use `cache_hit` as the authoritative hit signal
     needs_retrieval: bool = False  # S3 hint: cache under-covered even after recall — you MAY retry/widen
+    read_id: str = ""           # v0.6: this read's id — hand it to report_refusal() when YOUR
+    #                             answerer refuses over the served payload (the behavioral
+    #                             residual-span fallback; requires residual_spans=True)
 
     @property
     def raw_text(self) -> str:
@@ -191,8 +250,11 @@ class SemanticCache:
         widen_on_admission: bool | None = None,
         split_by_artifact: bool = False,
         serve: str = "unit",
-        serve_budget: int = 600,
+        serve_budget: int | None = None,
         pool_header: Callable[[Cognition], str] | None = None,
+        read_path: str = "unit",
+        serve_gate: float | None = None,
+        reranker: Callable[[str, list[str]], list[float]] | None = None,
         fast: bool | str = "auto",
         hit_margin: float = 0.0,
         coverage_floor: float | None = None,
@@ -214,11 +276,19 @@ class SemanticCache:
         select_floor: float | None = None,
         residual_floor: float | None = None,
         residual_limit: int = 24,
+        residual_spans: bool = False,
+        span_tau: float = 0.62,
+        span_margin: float = 0.0,
+        span_serve_floor: float = 0.35,
+        lossy_threshold: int = 2,
+        query_keys: bool = False,
+        key_floor: float = 0.85,
         strategy: str = ContextStrategy.CONTEXT_FIRST,
         store: CognitionStore | None = None,
         freshness: FreshnessPolicy | None = None,
         clock: Callable[[], float] = time.time,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        claim_index: "ClaimIndex | Callable[[str], ClaimIndex] | None" = None,
     ) -> None:
         # Workload preset (v0.5): a named bundle of tuned knob values, applied ONLY to knobs the
         # caller left unset — an explicit kwarg always wins. "default" is a no-op; "multi_hop"
@@ -242,7 +312,7 @@ class SemanticCache:
         # can't fit both. Override explicitly, or tune via coalent.calibrate_thresholds.
         hit_default, cov_default = default_thresholds_for(self._embedder)
         self._threshold = hit_default if hit_threshold is None else hit_threshold
-        # v0.5 — adaptive hit gate (M4 warm-up finding: match scores INFLATE as units
+        # v0.5 — adaptive hit gate (warm-up finding: match scores INFLATE as units
         # accumulate, so a fixed threshold sinks below the noise floor and the cache
         # 'absorbs' everything, including unanswerable queries). Self-calibrates against
         # the cache's own cross-unit score distribution; opt-in.
@@ -251,7 +321,7 @@ class SemanticCache:
         self._builds_since_calib = 0
         # v0.5 gate v2 — the REUSE channel: a query whose SEED similarity to a cached unit is
         # near-identity is the same question asked again; it must hit regardless of the noise
-        # bar (M4 replay finding: the adaptive bar killed revisits; the blend diluted the seed
+        # bar (replay finding: the adaptive bar killed revisits; the blend diluted the seed
         # signal 70/30 — this reads the seed channel directly).
         self._reuse_threshold = reuse_threshold
         # v0.5 gate v3 — ADMISSION BY PROVENANCE (the sick-leave-paraphrase fix): before
@@ -279,9 +349,81 @@ class SemanticCache:
         if serve not in ("unit", "pool"):
             raise ValueError(f"serve must be 'unit' or 'pool', got {serve!r}")
         self._serve = serve
-        self._serve_budget = serve_budget
+        # v0.6 — the pool-first read path (spec §2). Opt-in via read_path="pool"; the default
+        # "unit" is byte-identical v0.5. Pool mode REQUIRES a semantic embedder (constructor-time
+        # guard): under the lexical HashingEmbedder, claim cosine collapses to keyword overlap and
+        # the whole gate/ranking substrate would amplify keyword coincidence.
+        if read_path not in ("unit", "pool"):
+            raise ValueError(f"read_path must be 'unit' or 'pool', got {read_path!r}")
+        if read_path == "pool" and isinstance(self._embedder, HashingEmbedder):
+            raise ValueError(
+                "read_path='pool' requires a semantic embedder — set OPENAI_API_KEY or pass "
+                "embedder=...; claim-cosine collapses to keyword overlap under HashingEmbedder"
+            )
+        if query_keys and read_path != "pool":
+            # Fail LOUD at construction: the key overlay serves only through the pool read
+            # path — on the unit path keys could attach + confirm yet structurally never
+            # fire (the exact silent-failure class a measured forensic run paid for).
+            raise ValueError("query_keys requires read_path='pool'")
+        if read_path == "pool" and pool_header is None:
+            # Measured ladder (n=605 graded): bare default 0.68 vs metadata callable 0.73 —
+            # the gap is source-identity questions honestly refusing. Warn, don't fail:
+            # the default header (unit title text) is legitimate when sources are homogeneous.
+            warnings.warn(
+                "read_path='pool' without pool_header: payload attribution falls back to unit "
+                "title text; per-source questions may refuse. Pass pool_header returning "
+                "'[title | source | date]' for full attribution (see the v0.6 upgrade guide).",
+                stacklevel=2,
+            )
+        self._read_path = read_path
+        # serve_gate: explicit float = ABSOLUTE (adaptation disabled entirely — the operator's
+        # off-ramp for exact, reproducible benches); None = adaptive against the pool's own
+        # null-shaped noise ceiling (§2.3), clamped at cov_default + 0.27.
+        self._serve_gate = serve_gate
+        # Rerank hook (BYO): influences SERVING ORDER only — the serve/build/floor decisions and
+        # pool_coverage always read the pre-rerank cosine, so a bad reranker can degrade order
+        # but never cause a false serve, a skipped build, or a broken null refusal.
+        self._reranker = reranker
+        # serve_budget default split: None -> 600 on the unit path (v0.5 preserved verbatim) and
+        # 1000 on the pool path (reproduces the measured ~1036-token operating point under the
+        # strict header-counting packing contract). Explicit values always win.
+        if serve_budget is not None and serve_budget <= 0:
+            raise ValueError(f"serve_budget must be positive, got {serve_budget}")
+        self._serve_budget = (serve_budget if serve_budget is not None
+                              else (1000 if read_path == "pool" else 600))
         self._pool_header = pool_header
         self._pool_state: tuple[Any, ...] | None = None   # lazy (marker, texts, unit_ids, embs)
+        # v0.6 — pool read-path state: adaptive-gate noise ceiling, lazy per-namespace index
+        # hydration, and the observability counters (§4.5) that make gate miscalibration a
+        # dashboard number instead of a silent duplicate-build tax.
+        self._pool_noise_ceiling = 0.0
+        self._pool_hydrated: set[str] = set()
+        self._pool_scan_slow = False
+        self._pool_serves = 0
+        self._probe_reads = 0
+        self._admission_reuses = 0
+        self._retrievals = 0
+        self._rebuilds_by_read = 0
+        self._builds_by_gap = 0
+        self._pool_units_sum = 0
+        self._pool_payloads = 0
+        self._last_collapsed: dict[tuple[str, int], tuple[str, int]] = {}
+        # v0.6 — invalidation counters replacing the (len, xor-hash) pool marker, whose
+        # in-place-rebuild cancellation (dirty -> rebuild -> fresh, same id & count restores the
+        # prior marker) could serve OLD claim texts from a memoized pool. Two monotone counters,
+        # one choke point each: ``_rows_epoch`` bumps ONLY when rows change (build / evict /
+        # backfill) and NEVER cancels; ``_status_gen`` bumps on any freshness flip. Cache-side
+        # lazy states (pool serving, the SE/UE/CE fast scan index) key on BOTH, so neither a
+        # same-size rebuild nor a stale flip can be masked by a colliding marker.
+        self._rows_epoch = 0
+        self._status_gen = 0
+        # v0.6 — the claim-pool storage port (one index per namespace). None uses the built-in
+        # LocalClaimIndex; a bare instance is single-namespace ONLY (a second namespace raises,
+        # telling the caller to pass a factory) so it can never leak claims across namespaces; a
+        # ``Callable[[str], ClaimIndex]`` factory mints one index per namespace.
+        self._claim_index_arg = claim_index
+        self._claim_indexes: dict[str, ClaimIndex] = {}
+        self._bare_index_ns: str | None = None
         # v0.5 — fast="auto": when numpy is importable the three O(cache-size) scans
         # (_best_match / _recall_claims / _bridge_claims) run their vectorized twins —
         # SAME control flow, matrix math instead of pure-Python cosines (equivalence is
@@ -342,6 +484,40 @@ class SemanticCache:
         # Bound the safety net so it can't defeat the token win on a big/numeric doc: keep only the
         # N LEAST-covered missed spans (ranked most-missed first). <= 0 = unlimited (escape hatch).
         self._residual_limit = residual_limit
+        # v0.6 (opt-in, OFF — nothing below runs when False; the default path is byte-identical):
+        # TIER-2 RESIDUAL SPANS, the measured extraction-loss net. At build, a sentence-coverage
+        # audit retains fact-bearing source sentences the extractor missed (max claim cosine <
+        # span_tau) as spans ON THE UNIT — never as pool rows (news pools stay lean). At read, a
+        # span that outranks every fresh claim by span_margin serves as a labeled side channel;
+        # span serves + raw-fallback escalations count toward lossy_threshold, and a lossy-marked
+        # unit repairs APPEND-ONLY on its next rebuild touch (claims are never lost while the
+        # source hash is unchanged — coverage is monotone).
+        self._residual_spans = residual_spans
+        self._span_tau = span_tau
+        self._span_margin = span_margin
+        self._span_serve_floor = span_serve_floor
+        self._lossy_threshold = lossy_threshold
+        self._span_state: tuple[Any, ...] | None = None   # lazy per-ns span matrix (epoch-keyed)
+        # The behavioral fallback channel: every read gets a deterministic read_id; the last
+        # _READ_LOG_CAP reads are remembered (query embedding, ns, served payload facts) so
+        # report_refusal(read_id) can answer a refusal with a residual-span retry payload.
+        self._read_seq = 0
+        self._read_log: dict[
+            str, tuple[tuple[float, ...], str, tuple[str, ...], tuple[str, ...], int, int]
+        ] = {}
+        # v0.6 (opt-in, OFF — its own switch on top of residual_spans): QUERY KEYS, the
+        # behavioral alternate retrieval keys (harness-measured: affected-question gold rank
+        # median 139 -> 0, top-20 0% -> 99% on paraphrases, controls unharmed). A refusal
+        # attaches the read's query embedding as a PROVISIONAL key on the span's owner;
+        # report_success() confirms it durable; the repair promotion transfers it to the
+        # claim row. At read time, keys overlay the pool scan: a claim's serving score is
+        # max(content_sim, key_sim) where a key counts ONLY at/above key_floor — below the
+        # floor the key row is ignored entirely (the v0.2-regression guard in the rule).
+        self._query_keys = query_keys
+        self._key_floor = key_floor
+        self._key_gen = 0                                 # bumps on attach/expire/evict
+        self._key_state: tuple[Any, ...] | None = None    # lazy per-ns key matrix
+        self._keys_by_read: dict[str, list[str]] = {}     # read_id -> units holding its keys
         self._strategy = strategy
         self._store = store
         self._freshness = freshness
@@ -384,9 +560,87 @@ class SemanticCache:
         if self._store is not None:
             self._store.put(unit)
 
+    def _dirty(self, unit: Cognition) -> None:
+        """Mark a unit stale through the ONE freshness choke point: flip status and bump
+        ``_status_gen`` so every cache-side lazy state (pool serving, the fast scan index)
+        that snapshots freshness is invalidated on the next read. Callers persist as before.
+
+        Pool mode also masks the unit's claim rows in its namespace index. The in-proc state
+        is made consistent FIRST (status + generation), so a persistent adapter's ``mask``
+        failure — which MUST be loud (a shared index serving stale to other processes) —
+        propagates only after this process can no longer serve the stale rows."""
+        unit.mark_dirty()
+        self._status_gen += 1
+        if self._read_path == "pool":
+            idx = self._existing_index(unit.namespace)
+            if idx is not None:
+                idx.mask(unit.id)
+
     def _mark_fresh(self, unit: Cognition) -> None:
         unit.mark_fresh()
         unit.freshness_epoch = self._clock()
+        self._status_gen += 1
+        if self._read_path == "pool":
+            idx = self._existing_index(unit.namespace)
+            if idx is not None:
+                idx.unmask(unit.id)
+
+    def _existing_index(self, ns: str) -> ClaimIndex | None:
+        """The claim index already minted for ``ns`` — or None. Used by freshness flips and
+        eviction, which must never MINT an index (and never trip the bare-instance namespace
+        guard) just to mask rows that were never added."""
+        arg = self._claim_index_arg
+        if isinstance(arg, ClaimIndex):
+            return arg if self._bare_index_ns == ns else None
+        return self._claim_indexes.get(ns)
+
+    def _unit_is_fresh(self, unit_id: str) -> bool:
+        """Live freshness authority for a claim index's pull-mask: a unit is servable iff it
+        exists and is FRESH — evaluated per scan, never snapshotted into an index row."""
+        unit = self._units.get(unit_id)
+        return unit is not None and unit.is_fresh
+
+    def _resolve_claim_index(self, ns: str) -> ClaimIndex:
+        """Resolve the :class:`ClaimIndex` for a namespace — the single choke point both the
+        build (add) and read (search) paths funnel through, so the namespace guard applies to
+        both. A factory (or the built-in default) mints one index per namespace; a bare instance
+        is bound to the first namespace it serves and a second namespace raises, since sharing one
+        instance across namespaces would leak claims (the D1 defect)."""
+        arg = self._claim_index_arg
+        if isinstance(arg, ClaimIndex):
+            # Bare instance: single-namespace only (checked on BOTH add and search via this method).
+            if self._bare_index_ns is None:
+                self._bare_index_ns = ns
+            elif self._bare_index_ns != ns:
+                raise ValueError(
+                    f"a bare ClaimIndex instance is single-namespace only (bound to "
+                    f"{self._bare_index_ns!r}, now asked for {ns!r}) — pass a factory "
+                    "claim_index=lambda ns: LocalClaimIndex(...) so each namespace gets its own"
+                )
+            return arg
+        idx = self._claim_indexes.get(ns)
+        if idx is None:
+            if callable(arg):
+                idx = arg(ns)
+            else:
+                idx = LocalClaimIndex(fresh_of=self._unit_is_fresh)
+            self._claim_indexes[ns] = idx
+        return idx
+
+    @staticmethod
+    def _sum_usage(a: Usage | None, b: Usage | None) -> Usage | None:
+        """Combine two synthesis-call usages so a multi-build read reports the TOTAL it spent
+        (the D4 fix). None is the additive identity; the first known model label is kept."""
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return Usage(
+            prompt_tokens=a.prompt_tokens + b.prompt_tokens,
+            completion_tokens=a.completion_tokens + b.completion_tokens,
+            model=a.model or b.model,
+            cost=a.cost + b.cost,
+        )
 
     # ---------------------------------------------------------------- read
     def get(
@@ -404,9 +658,14 @@ class SemanticCache:
         query auto-escalates to fresh raw — no manual signal. ``related`` folds in
         up to N related units; ``strategy`` overrides the context payload policy.
         """
+        if self._read_path == "pool":
+            # v0.6 — the pool-first read path (opt-in). The unit path below stays byte-identical.
+            return self._pool_read(query, namespace=namespace, related=related, strategy=strategy)
         strat = strategy or self._strategy
         ns = namespace or ""
         qe = tuple(self._embedder.embed(query))
+        self._read_seq += 1
+        read_id = f"read-{self._read_seq}"   # deterministic (a monotonic counter string)
         read_usage: Usage | None = None  # synth cost of THIS read; None on a hit OR a usage-less provider
 
         best_id, best_score, second_score = self._best_match(qe, ns)
@@ -439,7 +698,7 @@ class SemanticCache:
                         if u_ is not None and u_.is_fresh and not all(
                             self._chunk_contained(c, ns) for c in probe if c.artifact_id == a
                         ):
-                            u_.mark_dirty()
+                            self._dirty(u_)
                             dirtied.add(uid)
                 if dirtied and all(a in self._artifact_index for a in probe_ids):
                     best_id = max(dirtied, key=lambda uid: self._match_score(qe, self._units[uid]))
@@ -466,9 +725,9 @@ class SemanticCache:
             self._refresh_if_expired(unit)
             # Self-heal (v0.5): a unit whose synthesis FAILED must never be served hollow —
             # treat the hit as stale and re-materialize now (the lazy retry). Discovered in
-            # M4: transient build failures were being cached and served as empty context.
+            # transient build failures were being cached and served as empty context.
             if unit.is_fresh and unit.understanding.get("_synthesis_failed"):
-                unit.mark_dirty()
+                self._dirty(unit)
             if unit.is_fresh:
                 # Behavioral seed: remember the query that hit (recording only in 0.3.0;
                 # in-memory like the hit counter — not yet persisted per-hit).
@@ -627,6 +886,8 @@ class SemanticCache:
                 context["pool"] = pool_text
                 context["serve"] = "pool"
 
+        if self._residual_spans:
+            self._log_read(read_id, qe, ns, (unit.id,), (), 0)
         return Result(
             understanding=dict(unit.understanding),
             evidence=evidence,
@@ -641,6 +902,7 @@ class SemanticCache:
             escalated=escalated,
             recalled=recalled,
             needs_retrieval=needs_retrieval,
+            read_id=read_id,
         )
 
     def _match_score(self, qe: tuple[float, ...], unit: Cognition) -> float:
@@ -667,7 +929,7 @@ class SemanticCache:
         """The hit bar actually applied. With ``adaptive_hit``, never below the cache's own
         cross-unit noise ceiling — the p95 of best-match scores among units KNOWN to be about
         different things. As the cache grows and scores inflate, the bar rises with them, so
-        a falling build rate stays a REAL signal (M4 Grid-C finding)."""
+        a falling build rate stays a REAL signal (Grid-C finding)."""
         if not self._adaptive_hit:
             return self._threshold
         if self._noise_ceiling == 0.0 or self._builds_since_calib >= 16:
@@ -698,11 +960,13 @@ class SemanticCache:
 
     # ------------------------------------------------ fast scan twin (v0.5, optional numpy)
     def _fast_index(self) -> tuple[Any, ...] | None:
-        """Lazy q-independent structures for the vectorized scans; invalidated by the same
-        marker as the pool (unit added/removed/freshness flip). None when numpy is absent."""
+        """Lazy q-independent structures for the vectorized scans; keyed on
+        ``(_rows_epoch, _status_gen)`` — the fast index snapshots ``is_fresh`` into its claim
+        metadata, so a freshness flip (``_status_gen``) MUST rebuild it as well as a row change
+        (``_rows_epoch``). None when numpy is absent."""
         if not self._fast_enabled or _np is None:
             return None
-        marker = self._pool_marker()
+        marker = (self._rows_epoch, self._status_gen)
         state = self._fast_state
         if state is not None and state[0] == marker:
             return state
@@ -820,6 +1084,7 @@ class SemanticCache:
         hook (BYO reranker / score threshold). De-noises the understanding, provenance,
         AND the raw floor in one place — used by both materialize and escalation. With
         no gate it is plain retrieval. Coalent never reranks itself ("context != retriever")."""
+        self._retrievals += 1     # the query-shaped retrieval counter (pool invariant: <= 1/read)
         chunks = self._retriever.retrieve(query, namespace=ns or None)
         if self._relevance_gate is not None:
             chunks = list(self._relevance_gate(query, chunks))
@@ -890,7 +1155,7 @@ class SemanticCache:
             return self._build_unit(unit, query, qe, built)
         # One unit per SOURCE: the dominant artifact keeps this unit's identity; every other
         # artifact gets its own sibling unit — so a mixed retrieval can never blend topics
-        # into one lossy understanding (the M4 digest/multi-source finding).
+        # into one lossy understanding (the digest/multi-source finding).
         ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))
         # never re-synthesize an already-CONTAINED source; a covered-but-thin source gets its
         # EXISTING unit rebuilt widened (no duplicate) — the v0.5 containment semantics
@@ -909,29 +1174,38 @@ class SemanticCache:
                 todo.append((artifact_id, chs, None))
         if not todo:
             todo = [(ordered[0][0], ordered[0][1], None)]
+        # D4 fix: a multi-source read runs SEVERAL synthesis calls; ``read_usage`` (-> Result.usage)
+        # must report the TOTAL spent, not just the dominant build. Sum every _build_unit usage;
+        # track whether the dominant unit itself was built with a dedicated flag (``usage`` is no
+        # longer a proxy for that, now that sibling/rebuild calls also contribute to it).
         usage: Usage | None = None
         first = True
+        dominant_built = False
         for artifact_id, chs, existing in todo:
             built_chunks = self._widen_group(artifact_id, chs)
             if existing is not None:                  # widen-rebuild in place: no duplicate
-                self._build_unit(existing, query, qe, built_chunks)
+                usage = self._sum_usage(usage,
+                                        self._build_unit(existing, query, qe, built_chunks))
                 self._emit("unit_rebuilt", unit_id=existing.id, reason="widen",
                            artifact_id=artifact_id)
                 if first:
                     first = False
                 continue
             if first:
-                usage = self._build_unit(unit, query, qe, built_chunks)
+                usage = self._sum_usage(usage,
+                                        self._build_unit(unit, query, qe, built_chunks))
                 first = False
+                dominant_built = True
                 continue
             sibling = self._new_unit(f"{query} · {artifact_id}", qe, ns)
-            self._build_unit(sibling, query, qe, built_chunks)
+            usage = self._sum_usage(usage,
+                                    self._build_unit(sibling, query, qe, built_chunks))
             self._units[sibling.id] = sibling
             self._emit("unit_built", unit_id=sibling.id, reason="split",
                        artifact_id=artifact_id)
-        if usage is None:                             # dominant was a widen-rebuild
-            usage = self._build_unit(unit, query, qe,
-                                     self._widen_group(todo[0][0], todo[0][1]))
+        if not dominant_built:                        # dominant was a widen-rebuild
+            usage = self._sum_usage(usage, self._build_unit(
+                unit, query, qe, self._widen_group(todo[0][0], todo[0][1])))
         return usage
 
     def _learn_from_escalation(
@@ -996,12 +1270,28 @@ class SemanticCache:
             unit.understanding_embedding, unit.claim_embeddings = self._cognition_embeddings(
                 understanding
             )
+        # v0.6 tier-2 residual spans (opt-in): the build-time sentence-coverage audit — retain
+        # fact-bearing evidence sentences the extraction missed as spans ON the unit (provenance
+        # captured now, never re-derived). A (re)build also clears the lossy signals: whatever
+        # this unit failed to cover before, it was just re-extracted against current sources.
+        if self._residual_spans:
+            unit.residual_spans = (
+                self._capture_residual_spans(
+                    chunks, self._claim_texts(understanding), unit.claim_embeddings)
+                if synthesis.ok else ()
+            )
+            unit.span_hits = 0
+            unit.lossy = False
+        if self._query_keys:
+            self._rebind_keys(unit)   # claim positions regenerated — re-point every key
         unit.synth_tokens = synthesis.usage.total_tokens if synthesis.usage is not None else 0
         self._builds_since_calib += 1
         unit.touch()  # a build, not a hit -> no query recorded
         self._mark_fresh(unit)
         self._reindex(unit)
         self._persist(unit)
+        self._rows_epoch += 1     # the unit's claim rows changed — monotone, never cancels
+        self._index_unit_rows(unit)   # pool mode: incremental per-unit row replacement
         return synthesis.usage
 
     def _account_usage(self, usage: Usage | None) -> None:
@@ -1078,12 +1368,185 @@ class SemanticCache:
         kept = scored if self._residual_limit <= 0 else scored[: self._residual_limit]
         return [text for _covered, text in kept]
 
+    # ------------------------------------------ tier-2 residual spans (v0.6, opt-in)
+    def _capture_residual_spans(
+        self,
+        chunks: list[Chunk],
+        claim_texts: list[str],
+        claim_embeddings: tuple[tuple[float, ...], ...],
+    ) -> tuple[ResidualSpan, ...]:
+        """The build-time sentence-coverage audit (the preventive detector for the measured
+        50-84% harmful extraction loss). Splits the unit's retained evidence into sentences
+        (>= _SPAN_MIN_WORDS words, starting with a capitalized word or digit, no embedded
+        blank line; a stranded <=3-char splitter orphan is stripped first), keeps the
+        FACT-BEARING ones (a number or a multi-word capitalized name; boilerplate excluded)
+        that carry a HARD FACT absent from every claim text — a multi-char number no claim
+        contains, or a capitalized name none mentions (the phrasing-gap false-alarm killer:
+        a sentence whose facts all live in rephrased claims is covered, not lost). Survivors
+        are embedded in ONE batch call; those under ``span_tau`` max claim cosine become
+        tier-2 spans — verbatim text + artifact + evidence-chunk index, provenance captured
+        at build and never re-derived — capped at ``_SPAN_CAP`` most-clearly-uncovered per
+        unit. Spans are NEVER added to the claim pool (zero crowding); they serve only
+        through the side channel."""
+        claim_blob = " ".join(claim_texts).lower()
+        cand: list[tuple[str, str, int]] = []
+        seen: set[str] = set()
+        for idx, chunk in enumerate(chunks):
+            for raw in _SENT_SPLIT.split(chunk.text):
+                s = raw.strip()
+                m = _SPAN_ORPHAN.match(s)             # "ET\n\nPotential Super Bowl..." relic
+                if m:
+                    s = s[m.end():].strip()
+                if not s or "\n\n" in s or s in seen:
+                    continue
+                if len(s.split()) < _SPAN_MIN_WORDS:
+                    continue
+                if not (s[0].isupper() or s[0].isdigit()):
+                    continue                          # segmentation orphans never start caps
+                if not (_NUM.search(s) or _SPAN_NAME.search(s)):
+                    continue                          # fact-bearing sentences only
+                if _SPAN_BOILERPLATE.search(s):
+                    continue                          # privacy/cookie/subscribe/liveblog chrome
+                if not self._has_absent_hard_fact(s, claim_blob):
+                    continue                          # every hard fact already lives in a claim
+                seen.add(s)
+                cand.append((s, chunk.artifact_id, idx))
+        if not cand:
+            return ()
+        scored: list[tuple[float, ResidualSpan]] = []
+        for (text, artifact_id, idx), raw_emb in zip(
+            cand, embed_texts(self._embedder, [c[0] for c in cand])
+        ):
+            emb = tuple(raw_emb)
+            if not emb or not any(emb):
+                continue
+            covered = max((cosine(emb, ce) for ce in claim_embeddings if ce), default=0.0)
+            if covered < self._span_tau:
+                scored.append((covered, ResidualSpan(text=text, artifact_id=artifact_id,
+                                                     chunk_idx=idx, embedding=emb)))
+        scored.sort(key=lambda cs: cs[0])   # most clearly uncovered first (stable: doc order)
+        return tuple(span for _covered, span in scored[:_SPAN_CAP])
+
+    @staticmethod
+    def _has_absent_hard_fact(sentence: str, claim_blob: str) -> bool:
+        """True when the sentence carries at least one HARD fact no claim text contains: a
+        multi-char number (substring check against the lowercased concatenated claims) or a
+        multi-word capitalized name (case-insensitive containment). A sentence whose facts
+        all appear in the claims is a phrasing gap, not extraction loss — the eyeball-audit
+        false-alarm mode this predicate kills."""
+        for num in _HARD_NUM.findall(sentence):
+            if len(num) > 1 and num not in claim_blob:
+                return True
+        for name in _SPAN_NAME.findall(sentence):
+            if name.lower() not in claim_blob:
+                return True
+        return False
+
+    def _bump_lossy(self, unit: Cognition, reason: str) -> None:
+        """One lossy signal against a unit (a residual-span serve, or a raw-fallback
+        escalation over its source). Crossing ``lossy_threshold`` marks the unit lossy —
+        ONCE — so the next rebuild touch repairs it via the append-only path."""
+        unit.span_hits += 1
+        if not unit.lossy and unit.span_hits >= self._lossy_threshold:
+            unit.lossy = True
+            self._emit("unit_marked_lossy", unit_id=unit.id, reason=reason)
+        self._persist(unit)
+
+    def _repair_unit(
+        self, unit: Cognition, query: str, qe: tuple[float, ...], chunks: list[Chunk]
+    ) -> Usage | None:
+        """Repair a lossy-marked unit via the existing rebuild-in-place machinery, with THE
+        APPEND-ONLY INVARIANT: when the source content is provably UNCHANGED since build
+        (every previously-cited span's content hash for a re-fetched artifact is still present
+        in the new chunks), the merged claim set is union(old, new) deduped within-unit at
+        ``_SPAN_DEDUP_SIM`` — old claims are NEVER lost, coverage is monotone. A CHANGED hash
+        falls through to the full replace the rebuild already performed (stale behavior).
+        Emits ``unit_repaired{unit_id, added_claims, kept_claims}`` either way."""
+        old_texts_all, old_embs_all = self._atomic_rows(unit)
+        old_atomic = [(t, e) for t, e in zip(old_texts_all, old_embs_all) if t and any(e)]
+        new_hashes: dict[str, set[str]] = {}
+        for c in chunks:
+            h = c.content_hash or SourceSpan.from_text(c.artifact_id, c.text).content_hash
+            new_hashes.setdefault(c.artifact_id, set()).add(h)
+        prov_spans = unit.provenance.source_spans
+        unchanged = (
+            any(span.artifact_id in new_hashes for span in prov_spans)   # can't prove -> changed
+            and all(
+                span.content_hash in new_hashes[span.artifact_id]
+                for span in prov_spans
+                if span.artifact_id in new_hashes
+            )
+        )
+        usage = self._build_unit(unit, query, qe, chunks)   # the rebuild-in-place machinery
+        if not unchanged or not old_atomic:
+            new_texts, new_embs = self._atomic_rows(unit)
+            n_new = sum(1 for t, e in zip(new_texts, new_embs) if t and any(e))
+            self._emit("unit_repaired", unit_id=unit.id,
+                       added_claims=n_new, kept_claims=0)   # full replace (stale behavior)
+            return usage
+        # Append-only merge: old claims first (never lost), then new claims that are not
+        # near-duplicates of anything kept. Then re-key the unit and re-index its pool rows
+        # (add() has REPLACE semantics, so the pool holds no duplicate rows after repair).
+        kept_texts = [t for t, _e in old_atomic]
+        kept_embs = [e for _t, e in old_atomic]
+        kept_set = set(kept_texts)
+        added = 0
+        new_texts, new_embs = self._atomic_rows(unit)
+        for t, e in zip(new_texts, new_embs):
+            if not t or not any(e) or t in kept_set:
+                continue
+            if max((cosine(e, ke) for ke in kept_embs), default=0.0) >= _SPAN_DEDUP_SIM:
+                continue
+            kept_texts.append(t)
+            kept_embs.append(e)
+            kept_set.add(t)
+            added += 1
+        if self._query_keys and unit.query_keys:
+            # REAL span->claim promotion (the binding heal): a keyed span's VERBATIM source
+            # sentence joins the merged claim set — append-only consistent (it is retained
+            # source text), within-unit 0.95 dedup applies — so _rebind_keys below binds the
+            # key to a real claim row by guaranteed-verbatim identity and the span-serving
+            # row self-retires for it. Real LLM extraction never reproduces the sentence
+            # byte-for-byte; promotion must not depend on it.
+            promo = [t for t in dict.fromkeys(k.span_text for k in unit.query_keys)
+                     if t and t not in kept_set]
+            for t, raw_e in zip(promo, embed_texts(self._embedder, promo) if promo else []):
+                e = tuple(raw_e)
+                if not e or not any(e):
+                    continue
+                if max((cosine(e, ke) for ke in kept_embs), default=0.0) >= _SPAN_DEDUP_SIM:
+                    continue
+                kept_texts.append(t)
+                kept_embs.append(e)
+                kept_set.add(t)
+                added += 1
+        understanding = dict(unit.understanding)
+        understanding["claims"] = kept_texts
+        unit.understanding = understanding
+        unit.understanding_embedding, unit.claim_embeddings = self._cognition_embeddings(
+            understanding
+        )
+        # Re-audit the spans against the MERGED claim set (a merged-in claim may now cover
+        # what the fresh extraction alone missed).
+        unit.residual_spans = self._capture_residual_spans(
+            list(unit.evidence), self._claim_texts(understanding), unit.claim_embeddings)
+        if self._query_keys:
+            self._rebind_keys(unit)   # the merge moved claim positions — re-point the keys
+        self._persist(unit)
+        self._rows_epoch += 1     # the merge changed the unit's rows again — monotone
+        self._index_unit_rows(unit)
+        self._emit("unit_repaired", unit_id=unit.id,
+                   added_claims=added, kept_claims=len(old_atomic))
+        return usage
+
     def _backfill_cognition(self, unit: Cognition) -> None:
         """One-time upgrade of a pre-v0.3 unit: compute + persist its embeddings."""
         unit.understanding_embedding, unit.claim_embeddings = self._cognition_embeddings(
             unit.understanding
         )
         self._persist(unit)
+        self._rows_epoch += 1     # the unit's claim rows materialized — monotone
+        self._index_unit_rows(unit)   # pool mode: incremental per-unit row replacement
 
     # ------------------------------------------------ context intelligence
     def _semantic_coverage(self, qe: tuple[float, ...], unit: Cognition) -> float:
@@ -1092,7 +1555,7 @@ class SemanticCache:
         depends on whether there is anything SERVABLE at all: a structured/passthrough
         unit with real content keeps the benign 1.0 ("can't prove a gap — don't
         penalize"), but an EMPTY unit (failed synthesis: no claims, no summary) reports
-        0.0 — v0.5 fix for the M4-discovered poison where hollow units claimed perfect
+        0.0 — v0.5 fix for the -discovered poison where hollow units claimed perfect
         coverage, suppressing recall AND the RAG-floor escalation, and served nothing."""
         if not unit.claim_embeddings:
             return 1.0 if self._text_of(unit.understanding).strip() else 0.0
@@ -1116,14 +1579,6 @@ class SemanticCache:
         return not isinstance(self._embedder, HashingEmbedder)
 
     # ------------------------------------------------ pool serving (v0.5 preview of v0.6)
-    def _pool_marker(self) -> tuple[int, int]:
-        """Cheap invalidation key for the lazy pool: changes whenever a unit is added,
-        removed, or flips freshness — the three events that alter the servable pool."""
-        h = 0
-        for uid, u in self._units.items():
-            h ^= hash((uid, u.status is Status.FRESH))
-        return (len(self._units), h)
-
     def _pool_rows(self, ns: str) -> tuple[list[str], list[str], list[tuple[float, ...]]]:
         """(claim_text, owner_unit_id, embedding) rows over FRESH units in ``ns`` only —
         freshness AND namespace isolation are the pool's contract: a stale unit's claims
@@ -1152,7 +1607,11 @@ class SemanticCache:
         ``serve_budget`` (~4 chars/token estimate), group consecutive picks under their
         owner unit with an optional caller-supplied header line. numpy when available;
         the pure-Python twin is exact but O(pool) — fine at small caches."""
-        marker = (ns, *self._pool_marker())
+        # Keyed on ``(ns, _rows_epoch, _status_gen)``: the cached pool snapshots BOTH the
+        # servable rows (``_rows_epoch``) and their freshness (``_status_gen``). Replacing the
+        # old (len, xor-hash) marker closes the in-place-rebuild cancellation hole — a monotone
+        # ``_rows_epoch`` cannot be restored to a prior value by a same-size rebuild.
+        marker = (ns, self._rows_epoch, self._status_gen)
         state = self._pool_state
         if state is None or state[0] != marker:
             texts, owners, embs = self._pool_rows(ns)
@@ -1200,6 +1659,1156 @@ class SemanticCache:
                     logger.debug("pool_header raised — ignored", exc_info=True)
             parts.append((head + "\n" if head else "") + "\n".join("- " + c for c in claim_group))
         return "\n\n".join(parts)
+
+    # ------------------------------------------------ pool-first read path (v0.6, read_path="pool")
+    def _pool_read(
+        self,
+        query: str,
+        *,
+        namespace: str | None,
+        related: int,
+        strategy: str | None,
+    ) -> Result:
+        """The claim-pool-first read (spec §2.4, P0–P8): every read is answered by
+        budget-packing the global fresh-claim pool; units remain the ownership /
+        freshness / build / provenance skeleton. At most ONE query-shaped retrieval
+        per read; gate/floor decisions read the PRE-rerank cosine only."""
+        # P0 — VALIDATE / EMBED
+        strat = strategy or self._strategy
+        ns = namespace or ""
+        qe = tuple(self._embedder.embed(query))
+        self._read_seq += 1
+        read_id = f"read-{self._read_seq}"   # deterministic (a monotonic counter string)
+        self._reads_total += 1
+        read_usage: Usage | None = None
+        synthesis_ran = False
+        retrieval_ran = False
+        probe_chunks: list[Chunk] = []
+        reuse_evidence: list[Chunk] = []
+        force_needs_retrieval = False
+        gate = self._effective_pool_gate()
+
+        # P1 — REUSE: near-identity SEED similarity = the same question asked again; it must
+        # serve regardless of the noise bar. A STALE reuse match rebuilds in place FIRST
+        # (consuming the read's single query-shaped retrieval), so the serve is never stale.
+        forced_serve = False
+        reuse_unit: Cognition | None = None
+        best_reuse = 0.0
+        for u in self._units.values():
+            if u.namespace != ns or not u.query_embedding:
+                continue
+            s = cosine(qe, u.query_embedding)
+            if s > best_reuse:
+                best_reuse, reuse_unit = s, u
+        if reuse_unit is not None and best_reuse >= self._reuse_threshold:
+            forced_serve = True
+            self._refresh_if_expired(reuse_unit)
+            if not reuse_unit.is_fresh:
+                self._stale_reads_prevented += 1
+                self._emit(
+                    "stale_read_prevented",
+                    unit_id=reuse_unit.id,
+                    query=query,
+                    unit_age_s=round(max(self._clock() - reuse_unit.freshness_epoch, 0.0), 3),
+                )
+                read_usage = self._sum_usage(
+                    read_usage, self._materialize_into(reuse_unit, query, qe, ns))
+                synthesis_ran = True
+                retrieval_ran = True
+                reuse_evidence = list(reuse_unit.evidence)
+                self._emit(
+                    "rebuild_triggered_by_read",
+                    unit_id=reuse_unit.id,
+                    artifact_id=next(iter(sorted(reuse_unit.provenance.artifact_ids())), ""),
+                    reason="reuse_stale",
+                )
+                self._rebuilds_by_read += 1
+            elif self._residual_spans and reuse_unit.lossy:
+                # Lossy repair on touch (tier-2 loop): the near-identity revisit IS this
+                # unit's next touch — repair it FIRST via the append-only rebuild (consuming
+                # the read's single retrieval), so the serve is post-repair. Only the unit's
+                # OWN sources feed the repair; a probe with none of them skips (net stays up).
+                probe_chunks = self._retrieve(query, ns)
+                retrieval_ran = True
+                own = reuse_unit.provenance.artifact_ids()
+                own_chunks = [c for c in probe_chunks if c.artifact_id in own]
+                if own_chunks:
+                    read_usage = self._sum_usage(
+                        read_usage, self._repair_unit(reuse_unit, query, qe, own_chunks))
+                    synthesis_ran = True
+                    reuse_evidence = list(reuse_unit.evidence)
+                    self._rebuilds_by_read += 1
+            reuse_unit.touch(
+                query if self._learn_behavior else None, max_queries=self._max_hit_queries)
+
+        # P2 — POOL SCAN via the ClaimIndex; freshness is a live pull-mask, never cached in rows.
+        index = self._pool_index(ns)
+        if _np is None and len(index) > _PUREPY_POOL_WARN_ROWS and not self._pool_scan_slow:
+            self._pool_scan_slow = True
+            logger.warning(
+                "pure-python pool scan over %d rows — install coalent[fast] for numpy",
+                len(index))
+        cands = self._index_search(index, qe, _POOL_STAGE1_RAW)
+        fresh_rows = [(s, ref) for s, ref, fresh in cands if fresh]
+        stale_hits = [(s, ref) for s, ref, fresh in cands if not fresh and s >= gate]
+        if stale_hits:  # telemetry only — include_stale MAY be unsupported (event won't fire)
+            self._emit(
+                "pool_masked_stale",
+                n_rows=len(stale_hits),
+                units=sorted({ref.unit_id for _, ref in stale_hits})[:8],
+                top_stale_score=round(max(s for s, _ in stale_hits), 4),
+            )
+
+        # P3 — bounded TTL: clock-compare the candidate-head owners only; at most
+        # _MAX_TTL_REVALIDATIONS_PER_READ revalidator calls; at most ONE re-scan.
+        ttl_masked: set[str] = set()
+        if (self._freshness is not None and self._freshness.max_age is not None
+                and fresh_rows):
+            ttl_masked, flipped = self._pool_ttl(fresh_rows)
+            if flipped:
+                cands = self._index_search(index, qe, _POOL_STAGE1_RAW)
+                fresh_rows = [(s, ref) for s, ref, fresh in cands if fresh]
+            if ttl_masked:
+                fresh_rows = [(s, ref) for s, ref in fresh_rows
+                              if ref.unit_id not in ttl_masked]
+        key_fired: set[int] = set()
+        fresh_rows = self._apply_query_keys(ns, qe, fresh_rows, ttl_masked, key_fired)
+        cov0 = fresh_rows[0][0] if fresh_rows else 0.0
+
+        # P4 — GATE (pre-rerank cosine only; a reranker can never influence this decision).
+        outcome = "reuse" if forced_serve else ("serve" if cov0 >= gate else "build")
+        self._emit("pool_gate", coverage=round(cov0, 4), gate=round(gate, 4), outcome=outcome)
+        if outcome != "build":
+            self._pool_serves += 1
+
+        # P5 — BUILD: one probe retrieval, classified per artifact (CONTAINED / STALE-OWNED /
+        # THIN / NOVEL), capped at _MAX_BUILDS_PER_READ synthesis ops. Admission is STRUCTURAL:
+        # all-contained probes serve with zero synthesis (provenance PROVES coverage).
+        if outcome == "build":
+            probe_chunks = self._retrieve(query, ns)   # THE single query-shaped retrieval
+            retrieval_ran = True
+            if not probe_chunks:
+                force_needs_retrieval = True           # cold start: serve what the pool has
+            else:
+                built_usage, ran, touched = self._pool_probe_build(
+                    query, qe, ns, probe_chunks, cov0, gate)
+                read_usage = self._sum_usage(read_usage, built_usage)
+                if ran:
+                    synthesis_ran = True
+                    ttl_masked -= touched              # a rebuilt owner is verifiably fresh
+                    cands = self._index_search(index, qe, _POOL_STAGE1_RAW)
+                    fresh_rows = [(s, ref) for s, ref, fresh in cands
+                                  if fresh and ref.unit_id not in ttl_masked]
+        fresh_rows = self._apply_query_keys(ns, qe, fresh_rows, ttl_masked, key_fired)
+        final_cov = fresh_rows[0][0] if fresh_rows else 0.0
+
+        # Serving pipeline (order only — decisions above already used pre-rerank cosine).
+        kept = self._pool_candidates(fresh_rows)
+        ordered, reranked, rerank_ms = self._pool_rank(query, kept)
+        picked, est_used, headers = self._pool_pack(ordered)
+        served_texts = [h.text for h in picked]
+
+        # Tier-2 side channel (opt-in residual_spans): under the ranking-anomaly rule, a
+        # fresh unit's residual span that outranks EVERY fresh claim serves as a labeled
+        # excerpt inside the same budget. In-memory scoring only — never a retrieval; the
+        # comparison reads the pre-S2 claim cosine (final_cov here) so both sides are cosines.
+        served_spans: list[tuple[str, str]] = []
+        if self._residual_spans:
+            served_spans, est_used, headers = self._serve_residual_spans(
+                ns, qe, final_cov, picked, headers, est_used)
+
+        # P6 — S2 band: the opt-in reliable containment scorer judges the texts that WILL be
+        # served, only inside the ambiguous band (packing is deterministic given the rows, so
+        # the payload is computed first and the scorer sees exactly what serves).
+        if (self._coverage_scorer is not None
+                and self._coverage_floor <= final_cov < self._coverage_ceiling):
+            final_cov = self._coverage_scorer(query, {"claims": list(served_texts)})
+
+        # P7 — the RAG floor: under-coverage appends raw, deduplicated, budget-capped but never
+        # empty. Raw priority: (a) the P5 probe chunks; (b) a P1 reuse-stale rebuild's retrieved
+        # chunks; (c) else retrieve NOW — which is then the read's single retrieval (the
+        # S2-demoted pure serve keeps the shipped v0.5 hit-path contract).
+        escalated = False
+        raw_chunks: list[Chunk] = []
+        if (final_cov < self._coverage_floor
+                and self._enable_coverage_escalation
+                and self._emits_raw(strat, escalated=True)
+                and not self._emits_raw(strat, escalated=False)):
+            src = probe_chunks or reuse_evidence
+            if not src and not retrieval_ran:
+                src = self._retrieve(query, ns)
+                retrieval_ran = True
+                probe_chunks = src
+            raw_chunks = self._floor_pack(src)
+            escalated = True
+            self._reads_escalated += 1
+            if self._residual_spans:
+                # Escalation feedback (tier-2 loop): a served raw chunk whose artifact a
+                # FRESH unit owns proves that unit under-covered its own source — one lossy
+                # signal per owning unit per read (reason "raw_fallback").
+                fallback_owners: set[str] = set()
+                for c in raw_chunks:
+                    for uid in self._artifact_index.get(c.artifact_id, ()):
+                        u2 = self._units.get(uid)
+                        if u2 is not None and u2.is_fresh and u2.namespace == ns:
+                            fallback_owners.add(uid)
+                for uid in sorted(fallback_owners):
+                    self._bump_lossy(self._units[uid], "raw_fallback")
+        needs_retrieval = force_needs_retrieval or final_cov < self._coverage_floor
+
+        # Adaptive-gate recalibration: at the END of a build read (LLM latency hides it; the
+        # in-flight read used the previous ceiling).
+        if synthesis_ran and self._serve_gate is None and (
+                self._pool_noise_ceiling == 0.0 or self._builds_since_calib >= 16):
+            self._pool_noise_ceiling = self._pool_noise_floor()
+            self._builds_since_calib = 0
+
+        # P8 — PACK & SERVE: render, account, emit, return.
+        rendered = (self._pool_render_with_spans(picked, headers, served_spans)
+                    if served_spans else self._pool_render(picked, headers))
+        pool_claims = [RecalledClaim(claim=h.text, score=h.score, unit_id=h.unit_id)
+                       for h in picked]
+        top_owner = picked[0].unit_id if picked else ""
+        top_unit = self._units.get(top_owner) if top_owner else None
+
+        cache_hit = not synthesis_ran   # True iff ZERO synthesis calls ran this read
+        if cache_hit:
+            self._reads_hit += 1
+            if retrieval_ran:
+                self._probe_reads += 1   # retrieved without building — the gate-miss dashboard
+            if top_unit is not None:
+                # Conservative, continuous-with-v0.5 savings: credit the TOP served owner only.
+                self._tokens_saved += top_unit.synth_tokens
+        if picked:
+            owner_ids = {h.unit_id for h in picked}
+            self._pool_units_sum += len(owner_ids)
+            self._pool_payloads += 1
+            if cache_hit:
+                now = self._clock()
+                ages = [max(now - owner.freshness_epoch, 0.0)
+                        for uid in owner_ids
+                        if (owner := self._units.get(uid)) is not None]
+                if ages:   # pool mode: age-at-serve = MAX served-owner age this read
+                    age = max(ages)
+                    self._age_serve_sum += age
+                    self._age_serve_max = max(self._age_serve_max, age)
+                    self._age_serve_n += 1
+        self._emit(
+            "pool_served",
+            n_claims=len(picked),
+            n_units=len({h.unit_id for h in picked}),
+            coverage=round(final_cov, 4),
+            gate=round(gate, 4),
+            est_tokens=est_used,
+            budget=self._serve_budget,
+            candidates_raw=len(fresh_rows),
+            candidates_unique=len(kept),
+            reranked=reranked,
+            rerank_ms=rerank_ms,
+            reuse=forced_serve,
+        )
+
+        context: dict[str, Any] = {
+            "pool": rendered,
+            "serve": "pool",
+            "understanding": {"claims": list(served_texts)},
+        }
+        if escalated:
+            context["raw"] = self._attributed_raw(raw_chunks)
+        elif strat == ContextStrategy.CONTEXT_RAW and retrieval_ran:
+            context["raw"] = self._attributed_raw(probe_chunks or reuse_evidence)
+        evidence = (list(probe_chunks or reuse_evidence)
+                    if (synthesis_ran or escalated) else [])
+
+        if self._residual_spans:
+            self._log_read(
+                read_id, qe, ns,
+                tuple(sorted({h.unit_id for h in picked} | {u for u, _ in served_spans})),
+                tuple(t for _u, t in served_spans),
+                est_used,
+            )
+        return Result(
+            understanding={"claims": list(served_texts)},   # no summary key (documented)
+            evidence=evidence,
+            cache_hit=cache_hit,
+            unit_id=top_owner,          # owner of the top-ranked served claim
+            confidence=cov0,            # pre-decision pool coverage — what the gate read
+            namespace=ns,
+            related=(self._related(top_unit, qe, related, ns)
+                     if top_unit is not None else []),
+            context=context,
+            usage=read_usage,
+            coverage=final_cov,         # final post-build / post-S2
+            escalated=escalated,
+            recalled=[],                # unit-path field, kept one version
+            pool=pool_claims,
+            needs_retrieval=needs_retrieval,
+            read_id=read_id,
+        )
+
+    def _effective_pool_gate(self) -> float:
+        """The serve gate actually applied. An explicit ``serve_gate`` float is ABSOLUTE
+        (no adaptation — exact, reproducible benches). None adapts against the pool's own
+        null-shaped noise ceiling, clamped to ``cov_default + 0.27`` so a dense near-duplicate
+        pool can never gate real answers out (spec §2.3)."""
+        if self._serve_gate is not None:
+            return self._serve_gate
+        _, cov_default = default_thresholds_for(self._embedder)
+        return min(max(cov_default, self._pool_noise_ceiling + _POOL_GATE_MARGIN),
+                   cov_default + _POOL_GATE_CEILING_MARGIN)
+
+    def _pool_noise_floor(self) -> float:
+        """p95 of PROVENANCE-DISJOINT max claim cosines over <=24 fixed-seed probe units —
+        null-shaped noise, NOT cross-unit signal: a probe is compared only against atomic rows
+        of same-namespace units sharing NO artifact with it, so legitimate same-story signal
+        (the whole pool thesis) is excluded from "noise". <8 units -> 0.0. Pure-python path is
+        frozen (0.0 -> cov_default gate) above _PUREPY_POOL_WARN_ROWS rows."""
+        import random as _random
+
+        units = [u for u in self._units.values() if u.is_fresh and u.query_embedding]
+        if len(units) < 8:
+            return 0.0
+        # Pre-group candidate rows per namespace with owner provenance for the disjoint filter.
+        by_ns: dict[str, list[tuple[str, frozenset[str], Any]]] = {}
+        total_rows = 0
+        for u in self._units.values():
+            if not u.is_fresh:
+                continue
+            texts, embs = self._atomic_rows(u)
+            rows = [e for t, e in zip(texts, embs) if t and any(e)]
+            if not rows:
+                continue
+            total_rows += len(rows)
+            mat: Any = rows
+            if _np is not None:
+                m = _np.asarray(rows, dtype=_np.float64)
+                n = _np.linalg.norm(m, axis=1, keepdims=True)
+                mat = m / _np.where(n > 0, n, 1.0)
+            by_ns.setdefault(u.namespace, []).append(
+                (u.id, u.provenance.artifact_ids(), mat))
+        if _np is None and total_rows > _PUREPY_POOL_WARN_ROWS:
+            return 0.0
+        sample = _random.Random(len(units)).sample(units, min(24, len(units)))
+        maxima: list[float] = []
+        for probe in sample:
+            arts = probe.provenance.artifact_ids()
+            best = 0.0
+            if _np is not None:
+                q = _np.asarray(probe.query_embedding, dtype=_np.float64)
+                qn = float(_np.linalg.norm(q))
+                q = q / (qn if qn else 1.0)
+            for uid, o_arts, mat in by_ns.get(probe.namespace, []):
+                if uid == probe.id or (arts & o_arts):
+                    continue   # provenance-disjoint only — same-story units are SIGNAL
+                if _np is not None:
+                    if mat.shape[1] == len(probe.query_embedding):
+                        best = max(best, float((mat @ q).max()))
+                else:
+                    for e in mat:
+                        best = max(best, cosine(probe.query_embedding, e))
+            maxima.append(best)
+        maxima.sort()
+        return maxima[int(0.95 * (len(maxima) - 1))]
+
+    @staticmethod
+    def _atomic_rows(unit: Cognition) -> tuple[list[str], list[tuple[float, ...]]]:
+        """The unit's ATOMIC pool rows: claims + residuals, summary EXCLUDED (the measured
+        hollow-unit poison guard). Positions are preserved (blanks kept as "") so a row's
+        ``claim_idx`` always indexes straight into ``unit.claim_embeddings``."""
+        claims = unit.understanding.get("claims")
+        if not isinstance(claims, list):
+            return [], []
+        ces = unit.claim_embeddings or ()
+        n = min(len(claims), len(ces))
+        texts: list[str] = []
+        embs: list[tuple[float, ...]] = []
+        for i in range(n):
+            t = claims[i]
+            s = (str(t.get("claim") or t.get("text") or t) if isinstance(t, dict)
+                 else str(t)).strip()
+            texts.append(s)
+            embs.append(tuple(ces[i]))
+        return texts, embs
+
+    def _index_unit_rows(self, unit: Cognition) -> None:
+        """Push a unit's atomic rows into its namespace claim index (pool mode only) —
+        incremental per-unit REPLACE, never an epoch-triggered wholesale rebuild."""
+        if self._read_path != "pool":
+            return
+        texts, embs = self._atomic_rows(unit)
+        idx = self._resolve_claim_index(unit.namespace)
+        if any(t and any(e) for t, e in zip(texts, embs)):
+            idx.add(unit.id, texts, embs)
+        else:
+            idx.remove(unit.id)
+
+    def _pool_index(self, ns: str) -> ClaimIndex:
+        """Resolve + LAZILY hydrate the namespace's claim index on first search — no eager
+        O(pool) constructor work; store-loaded units are indexed here once."""
+        idx = self._resolve_claim_index(ns)
+        if ns not in self._pool_hydrated:
+            self._pool_hydrated.add(ns)
+            for unit in self._units.values():
+                if unit.namespace != ns:
+                    continue
+                texts, embs = self._atomic_rows(unit)
+                if any(t and any(e) for t, e in zip(texts, embs)):
+                    idx.add(unit.id, texts, embs)
+                    if not unit.is_fresh:
+                        idx.mask(unit.id)
+        return idx
+
+    def _index_search(
+        self, index: ClaimIndex, qe: tuple[float, ...], top_n: int
+    ) -> list[tuple[float, ClaimRef, bool]]:
+        """One pool scan. ``include_stale`` is telemetry-only and MAY be unsupported by an
+        adapter (fresh-only fallback). A broken BYO index fails OPEN — empty pool, so the read
+        falls to build/floor: more retrieval, never stale."""
+        try:
+            try:
+                return list(index.search(qe, top_n, include_stale=True))
+            except TypeError:
+                return list(index.search(qe, top_n))
+        except Exception:  # noqa: BLE001 — fail open, never stale, never crash the read
+            logger.warning("claim index search failed — treating the pool as empty",
+                           exc_info=True)
+            return []
+
+    def _pool_ttl(
+        self, fresh_rows: list[tuple[float, ClaimRef]]
+    ) -> tuple[set[str], bool]:
+        """P3 — bounded TTL over the CANDIDATE HEAD only (enough ranked rows to fill
+        2x serve_budget, <=32 distinct owners; the whole-store per-read sweep is the
+        GraphRAG tax). Returns (owners masked expired-unverified THIS read, any-flip)."""
+        policy = self._freshness
+        assert policy is not None and policy.max_age is not None
+        head: list[str] = []
+        seen: set[str] = set()
+        budget = 2 * self._serve_budget
+        used = 0
+        for _score, ref in fresh_rows:
+            if ref.unit_id not in seen:
+                seen.add(ref.unit_id)
+                head.append(ref.unit_id)
+                if len(head) >= 32:
+                    break
+            used += _est_tokens(ref.text)
+            if used >= budget:
+                break
+        now = self._clock()
+        masked: set[str] = set()
+        flipped = False
+        calls = 0
+        for uid in head:   # serving-rank priority
+            unit = self._units.get(uid)
+            if unit is None or not unit.is_fresh:
+                continue
+            if now - unit.freshness_epoch <= policy.max_age:
+                continue
+            if policy.revalidate is None:
+                self._dirty(unit)   # no revalidator -> conservatively rebuild on read
+                self._persist(unit)
+                flipped = True
+                continue
+            if calls >= _MAX_TTL_REVALIDATIONS_PER_READ:
+                masked.add(uid)     # expired-unverified for THIS read; later reads revalidate
+                continue
+            changed, spent = self._ttl_revalidate(
+                unit, policy.revalidate, _MAX_TTL_REVALIDATIONS_PER_READ - calls)
+            calls += spent
+            if changed is None:
+                masked.add(uid)     # ran out of revalidation budget mid-owner
+            elif changed:
+                self._dirty(unit)
+                self._persist(unit)
+                flipped = True
+            else:
+                self._mark_fresh(unit)   # revalidate-unchanged: fresh again, NO epoch bump
+                self._persist(unit)
+        return masked, flipped
+
+    def _ttl_revalidate(
+        self,
+        unit: Cognition,
+        revalidate: Callable[[str], tuple[str, str] | None],
+        calls_left: int,
+    ) -> tuple[bool | None, int]:
+        """Hash-revalidate one owner's artifacts under a call budget. Returns
+        (changed | None when the budget ran out unproven, revalidator calls spent)."""
+        spent = 0
+        for artifact_id in sorted(unit.provenance.artifact_ids()):
+            if spent >= calls_left:
+                return None, spent
+            try:
+                fetched = revalidate(artifact_id)
+            except Exception:  # revalidation must never crash a read
+                fetched = None
+            spent += 1
+            if fetched is None:
+                continue
+            text, version = fetched
+            event = ChangeEvent(
+                artifact_id=artifact_id,
+                version=version,
+                content_hash=SourceSpan.from_text(artifact_id, text).content_hash,
+            )
+            if self._content_changed(unit, event):
+                return True, spent
+        return False, spent
+
+    def _pool_probe_build(
+        self,
+        query: str,
+        qe: tuple[float, ...],
+        ns: str,
+        chunks: list[Chunk],
+        cov0: float,
+        gate: float,
+    ) -> tuple[Usage | None, bool, set[str]]:
+        """P5 probe-classify: group the probe by artifact; CONTAINED groups (every chunk
+        retained verbatim by a same-namespace unit — including a ``_synthesis_failed`` one,
+        whose retry trigger is provenance/TTL, never every read) cost nothing; STALE-OWNED /
+        THIN groups rebuild their existing unit IN PLACE; NOVEL groups build source-anchored
+        units. Capped at _MAX_BUILDS_PER_READ synthesis ops, best max-chunk-cosine first.
+        Returns (summed usage, any-synthesis-ran, unit ids touched)."""
+        groups: dict[str, list[Chunk]] = {}
+        for c in chunks:
+            groups.setdefault(c.artifact_id, []).append(c)
+        work: list[tuple[str, list[Chunk], Cognition | None]] = []
+        for aid, chs in groups.items():
+            # "" groups under the sentinel key and is always treated NOVEL.
+            if aid and all(self._chunk_contained(c, ns) for c in chs):
+                # CONTAINED — provenance PROVES coverage... unless the containing owner is
+                # lossy-marked (tier-2 loop): then this probe IS the unit's repair touch.
+                lossy_owner: Cognition | None = None
+                if self._residual_spans:
+                    lossy_owner = next(
+                        (u for uid in sorted(self._artifact_index.get(aid, ()))
+                         if (u := self._units.get(uid)) is not None
+                         and u.namespace == ns and u.is_fresh and u.lossy),
+                        None)
+                if lossy_owner is None:
+                    continue
+                work.append((aid, chs, lossy_owner))
+                continue
+            owner: Cognition | None = None
+            if aid:
+                ns_owners = [u for uid in sorted(self._artifact_index.get(aid, ()))
+                             if (u := self._units.get(uid)) is not None
+                             and u.namespace == ns]   # D3: containment/ownership is ns-scoped
+                stale_owners = [u for u in ns_owners if not u.is_fresh]
+                owner = stale_owners[0] if stale_owners else (
+                    ns_owners[0] if ns_owners else None)
+            work.append((aid, chs, owner))
+        if not work:
+            if groups:   # ALL CONTAINED + non-empty probe -> structural admission reuse
+                self._admission_reuses += 1
+                self._emit("admission_reuse", probed_sources=len(groups))
+            return None, False, set()
+        if len(work) > _MAX_BUILDS_PER_READ:
+            # Best max-chunk-cosine artifacts first; the rest converge on later reads.
+            def _group_score(chs: list[Chunk]) -> float:
+                embs = embed_texts(self._embedder, [c.text for c in chs])
+                return max((cosine(qe, tuple(e)) for e in embs if e), default=0.0)
+
+            work.sort(key=lambda w: -_group_score(w[1]))
+        usage: Usage | None = None
+        touched: set[str] = set()
+        built_new = 0
+        artifacts: list[str] = []
+        for aid, chs, owner in work[:_MAX_BUILDS_PER_READ]:
+            built_chunks = self._widen_group(aid, chs) if aid else chs
+            if owner is not None and self._residual_spans and owner.lossy:
+                # Lossy repair on touch (tier-2 loop): append-only when the source hash is
+                # unchanged (old claims never lost), full replace when it changed —
+                # unit_repaired fires inside; stale/thin events stay reserved for their paths.
+                if not owner.is_fresh:
+                    self._stale_reads_prevented += 1
+                    self._emit(
+                        "stale_read_prevented",
+                        unit_id=owner.id,
+                        query=query,
+                        unit_age_s=round(
+                            max(self._clock() - owner.freshness_epoch, 0.0), 3),
+                    )
+                usage = self._sum_usage(
+                    usage, self._repair_unit(owner, query, qe, built_chunks))
+                self._rebuilds_by_read += 1
+                touched.add(owner.id)
+            elif owner is not None:
+                reason = "thin" if owner.is_fresh else "stale"
+                if reason == "stale":
+                    self._stale_reads_prevented += 1
+                    self._emit(
+                        "stale_read_prevented",
+                        unit_id=owner.id,
+                        query=query,
+                        unit_age_s=round(
+                            max(self._clock() - owner.freshness_epoch, 0.0), 3),
+                    )
+                usage = self._sum_usage(
+                    usage, self._build_unit(owner, query, qe, built_chunks))
+                self._emit("rebuild_triggered_by_read", unit_id=owner.id,
+                           artifact_id=aid, reason=reason)
+                self._rebuilds_by_read += 1
+                touched.add(owner.id)
+            else:
+                # NOVEL: source-anchored identity — one unit per (namespace, artifact), always.
+                key = hashlib.sha1(f"{ns}|artifact:{aid}".encode("utf-8")).hexdigest()[:16]
+                unit = self._units.get(f"cog:{key}")
+                if unit is None:
+                    unit = Cognition(
+                        id=f"cog:{key}",
+                        namespace=ns,
+                        query=query,            # the triggering query is the birth seed
+                        query_embedding=qe,
+                        understanding={},
+                        evidence=(),
+                        provenance=ProvenanceManifest("none", "none"),
+                    )
+                    self._units[unit.id] = unit
+                usage = self._sum_usage(
+                    usage, self._build_unit(unit, query, qe, built_chunks))
+                self._emit("unit_built", unit_id=unit.id, reason="miss")
+                built_new += 1
+                touched.add(unit.id)
+            artifacts.append(aid)
+        self._builds_by_gap += built_new
+        self._emit("build_triggered_by_gap", coverage=round(cov0, 4), gate=round(gate, 4),
+                   artifacts=sorted(artifacts), n_units_built=built_new)
+        return usage, True, touched
+
+    # ------------------------------------------------ pool serving stack (v0.6, spec §3.1)
+    def _pool_candidates(
+        self, fresh_rows: list[tuple[float, ClaimRef]]
+    ) -> list[_PoolHit]:
+        """Stage-1: greedy near-dup collapse in descending-cosine order (numpy: vector dedup
+        at _POOL_DEDUP_SIM; pure-python: EXACT TEXT only), truncated to _POOL_STAGE1_WIDTH
+        unique rows. Collapse is WITHIN-OWNER ONLY (measured finding): a unit's own
+        rephrasings/duplicates are redundancy, but cross-owner near-duplicates — even exact
+        text — are CORROBORATION, and per-source questions need the owner's own attributed
+        copy, so they all survive. Rows whose owner no longer exists are dropped (deleted
+        sources never resurrect). ``collapsed_into`` is recorded for gold-transfer."""
+        hits: list[_PoolHit] = []
+        embs: list[tuple[float, ...] | None] = []
+        for score, ref in fresh_rows:
+            unit = self._units.get(ref.unit_id)
+            if unit is None:
+                continue
+            ces = unit.claim_embeddings or ()
+            emb = (tuple(ces[ref.claim_idx])
+                   if 0 <= ref.claim_idx < len(ces) and ces[ref.claim_idx] else None)
+            hits.append(_PoolHit(float(score), ref.unit_id, ref.claim_idx, ref.text))
+            embs.append(emb)
+        collapsed: dict[tuple[str, int], tuple[str, int]] = {}
+        kept: list[_PoolHit] = []
+        seen_text: dict[tuple[str, str], _PoolHit] = {}   # (owner, text) — never cross-owner
+        if _np is not None and hits:
+            dim = next((len(e) for e in embs if e), 0)
+            mat = _np.empty((min(len(hits), _POOL_STAGE1_WIDTH), dim or 1))
+            mat_owner: list[_PoolHit] = []   # kept rows that carry a vector, matrix-parallel
+            for h, e in zip(hits, embs):
+                if len(kept) >= _POOL_STAGE1_WIDTH:
+                    break
+                prior = seen_text.get((h.unit_id, h.text))
+                if prior is not None:
+                    collapsed[(h.unit_id, h.claim_idx)] = (prior.unit_id, prior.claim_idx)
+                    continue
+                if e is not None and len(e) == dim and mat_owner:
+                    v = _np.asarray(e, dtype=_np.float64)
+                    n = float(_np.linalg.norm(v))
+                    v = v / (n if n else 1.0)
+                    sims = mat[: len(mat_owner)] @ v
+                    near = next(
+                        (mat_owner[j] for j in range(len(mat_owner))
+                         if float(sims[j]) >= _POOL_DEDUP_SIM
+                         and mat_owner[j].unit_id == h.unit_id),   # same owner ONLY
+                        None)
+                    if near is not None:
+                        collapsed[(h.unit_id, h.claim_idx)] = (near.unit_id, near.claim_idx)
+                        continue
+                if e is not None and len(e) == dim and len(mat_owner) < mat.shape[0]:
+                    v = _np.asarray(e, dtype=_np.float64)
+                    n = float(_np.linalg.norm(v))
+                    mat[len(mat_owner)] = v / (n if n else 1.0)
+                    mat_owner.append(h)
+                seen_text[(h.unit_id, h.text)] = h
+                kept.append(h)
+        else:
+            for h in hits:
+                if len(kept) >= _POOL_STAGE1_WIDTH:
+                    break
+                prior = seen_text.get((h.unit_id, h.text))
+                if prior is not None:
+                    collapsed[(h.unit_id, h.claim_idx)] = (prior.unit_id, prior.claim_idx)
+                    continue
+                seen_text[(h.unit_id, h.text)] = h
+                kept.append(h)
+        self._last_collapsed = collapsed
+        return kept
+
+    def _pool_rank(
+        self, query: str, cand: list[_PoolHit]
+    ) -> tuple[list[_PoolHit], bool, float | None]:
+        """Stage-2: the BYO rerank hook — SERVING ORDER only. Sorted by (-score,
+        cosine_position), stable and deterministic; NaN sorts as -inf. Any exception,
+        length mismatch, or non-float score degrades to cosine order + ``rerank_failed``."""
+        if self._reranker is None or not cand:
+            return cand, False, None
+        t0 = time.perf_counter()
+        try:
+            raw = list(self._reranker(query, [h.text for h in cand]))
+            if len(raw) != len(cand):
+                raise ValueError(
+                    f"reranker returned {len(raw)} scores for {len(cand)} texts")
+            scores: list[float] = []
+            for s in raw:
+                if isinstance(s, bool) or not isinstance(s, (int, float)):
+                    raise TypeError(f"non-float reranker score: {s!r}")
+                f = float(s)
+                scores.append(float("-inf") if math.isnan(f) else f)
+        except Exception as exc:  # noqa: BLE001 — a BYO reranker must never break serving
+            self._emit("rerank_failed", reason=str(exc))
+            return cand, False, round((time.perf_counter() - t0) * 1000.0, 3)
+        ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        order = sorted(range(len(cand)), key=lambda i: (-scores[i], i))
+        return [cand[i] for i in order], True, ms
+
+    def _pool_pack(
+        self, order: list[_PoolHit]
+    ) -> tuple[list[_PoolHit], int, dict[str, str]]:
+        """Stage-3, THE packing contract: est(s) = max(1, len(s)//4); headers and separators
+        COUNT against serve_budget; walk the final order and STOP at the first overflow — no
+        skip-scanning (rank order is the contract). AT-LEAST-ONE: an oversized first claim
+        serves with its header dropped, and if still over, serves anyway + overrun event."""
+        budget = self._serve_budget
+        picked: list[_PoolHit] = []
+        headers: dict[str, str] = {}
+        running = 0
+        for hit in order:
+            opening = hit.unit_id not in headers
+            header = self._pool_header_text(hit.unit_id) if opening else ""
+            cost = _est_tokens("- " + hit.text)
+            if opening:
+                cost += 1   # the group separator/open
+                if header:
+                    cost += _est_tokens(header) + 1
+            if picked:
+                if running + cost > budget:
+                    break   # STOP — no skip-scanning
+            else:
+                if cost > budget and header:
+                    header = ""   # AT-LEAST-ONE: drop the header first
+                    cost = _est_tokens("- " + hit.text) + 1
+                if cost > budget:
+                    self._emit("pool_budget_overrun", est_tokens=cost)
+            if opening:
+                headers[hit.unit_id] = header
+            picked.append(hit)
+            running += cost
+        return picked, running, headers
+
+    @staticmethod
+    def _default_header(unit: Cognition) -> str:
+        """The built-in attribution line (measured finding: an unattributed pool payload
+        makes per-source questions unanswerable BY CONSTRUCTION — claims cannot name their
+        own outlet). Default = the spec §7.1 fallback header, shipped after the fork's
+        paid confirm measured the opaque id form 0.089 BELOW the rig-parity header
+        (0.6413 vs 0.7306 strict, n=605 — far past the 0.03 fork criterion): the unit's
+        build QUERY carries source-identifying text (e.g. "key facts of the article:
+        {title}"), so serve its first 60 chars as a "## " heading. Only a unit with no
+        query text falls back to the opaque "[source: {artifact_id}]" line; an explicit
+        ``pool_header`` callable still overrides everything."""
+        q = (unit.query or "").strip()
+        if q:
+            return "## " + q[:60]
+        aid = unit.evidence[0].artifact_id if unit.evidence else ""
+        return f"[source: {aid or unit.id}]"
+
+    def _pool_header_text(self, unit_id: str) -> str:
+        """The per-group attribution header. ``pool_header=None`` falls back to the built-in
+        default (``## {unit.query[:60]}``, else ``[source: ...]`` — spec §7.1 fork) — the
+        pool path is UNABLE to serve an unattributed group; a caller callback overrides it.
+        A raising hook is swallowed, never breaks serving (headerless then, and its cost is
+        never counted — the shipped contract)."""
+        unit = self._units.get(unit_id)
+        if unit is None:
+            return ""
+        if self._pool_header is None:
+            return self._default_header(unit)
+        try:
+            return str(self._pool_header(unit) or "")
+        except Exception:  # noqa: BLE001 — a header hook must never break serving
+            logger.debug("pool_header raised — ignored", exc_info=True)
+            return ""
+
+    @staticmethod
+    def _pool_render(picked: list[_PoolHit], headers: dict[str, str]) -> str:
+        """Stage-4: group by owner; group order = ascending best serving-rank in group;
+        WITHIN-group order = serving order (the measured operating point). Header once per
+        group, "- " claim lines, groups joined by blank lines."""
+        order_of: list[str] = []
+        groups: dict[str, list[str]] = {}
+        for hit in picked:
+            if hit.unit_id not in groups:
+                groups[hit.unit_id] = []
+                order_of.append(hit.unit_id)
+            groups[hit.unit_id].append(hit.text)
+        parts: list[str] = []
+        for uid in order_of:
+            head = headers.get(uid, "")
+            body = "\n".join("- " + c for c in groups[uid])
+            parts.append((head + "\n" + body) if head else body)
+        return "\n\n".join(parts)
+
+    # ------------------------------------ tier-2 span side channel (v0.6, opt-in serving)
+    def _residual_span_rows(
+        self, ns: str
+    ) -> tuple[list[tuple[str, ResidualSpan]], Any]:
+        """(owner_id, span) rows over FRESH units in ``ns`` plus a pre-normalized numpy
+        matrix (None on the pure path) — built lazily and keyed on
+        ``(ns, _rows_epoch, _status_gen)``, epoch-invalidated exactly like the pool index,
+        so a rebuild or a freshness flip refreshes it on the next read."""
+        marker = (ns, self._rows_epoch, self._status_gen)
+        state = self._span_state
+        if state is not None and state[0] == marker:
+            return state[1], state[2]
+        self._hydrate_span_embeddings(ns)
+        rows: list[tuple[str, ResidualSpan]] = []
+        dim = 0
+        for uid, u in self._units.items():
+            if u.namespace != ns or not u.is_fresh or not u.residual_spans:
+                continue
+            for span in u.residual_spans:
+                if not span.embedding or not any(span.embedding):
+                    continue
+                if dim == 0:
+                    dim = len(span.embedding)
+                if len(span.embedding) == dim:   # embedder-swap leftovers can't poison the matrix
+                    rows.append((uid, span))
+        matrix: Any = None
+        if _np is not None and rows:
+            m = _np.asarray([s.embedding for _, s in rows], dtype=_np.float64)
+            n = _np.linalg.norm(m, axis=1, keepdims=True)
+            matrix = m / _np.where(n > 0, n, 1.0)
+        self._span_state = (marker, rows, matrix)
+        return rows, matrix
+
+    @staticmethod
+    def _score_vectors(
+        matrix: Any, embs: list[tuple[float, ...]], qe: tuple[float, ...]
+    ) -> list[float]:
+        """Query cosine per stored vector — one matvec on the numpy path, the exact
+        pure-python twin otherwise. Shared by the span side channel and the key overlay."""
+        if matrix is not None:
+            q = _np.asarray(qe, dtype=_np.float64)
+            n = float(_np.linalg.norm(q))
+            q = q / (n if n else 1.0)
+            return [float(s) for s in (matrix @ q).tolist()]
+        return [cosine(qe, e) for e in embs]
+
+    @staticmethod
+    def _score_spans(
+        rows: list[tuple[str, ResidualSpan]], matrix: Any, qe: tuple[float, ...]
+    ) -> list[float]:
+        """Query cosine per span row — the anomaly channel's and report_refusal's scorer."""
+        return SemanticCache._score_vectors(matrix, [s.embedding for _, s in rows], qe)
+
+    def _log_read(
+        self,
+        read_id: str,
+        qe: tuple[float, ...],
+        ns: str,
+        served_units: tuple[str, ...],
+        served_span_texts: tuple[str, ...],
+        est_used: int,
+    ) -> None:
+        """Remember this read in the fallback ring buffer (last _READ_LOG_CAP reads):
+        what was asked (the query embedding), where (ns), and what served — so a later
+        report_refusal(read_id) can score the namespace's residual spans against the
+        ORIGINAL question and skip spans the refused payload already contained."""
+        self._read_log[read_id] = (qe, ns, served_units, served_span_texts,
+                                   est_used, self._serve_budget)
+        while len(self._read_log) > _READ_LOG_CAP:
+            expired = next(iter(self._read_log))
+            self._read_log.pop(expired)
+            self._expire_provisional_keys(expired)   # unconfirmed keys expire with the ring
+
+    def _hydrate_span_embeddings(self, ns: str) -> None:
+        """Store-loaded spans carry NO embeddings (serde persists text + provenance only —
+        the embedding is regenerable, and ~30KB/span of JSON is not). Re-embed every missing
+        one in ONE batch on the namespace's first side-channel use; freshly-built spans keep
+        their in-memory embedding, so nothing re-embeds twice in-process."""
+        units = [u for u in self._units.values()
+                 if u.namespace == ns and u.is_fresh
+                 and any(not s.embedding for s in u.residual_spans)]
+        if not units:
+            return
+        texts = [s.text for u in units for s in u.residual_spans if not s.embedding]
+        embs = iter(embed_texts(self._embedder, texts))
+        for u in units:
+            u.residual_spans = tuple(
+                s if s.embedding else ResidualSpan(
+                    text=s.text, artifact_id=s.artifact_id, chunk_idx=s.chunk_idx,
+                    embedding=tuple(next(embs)))
+                for s in u.residual_spans
+            )
+
+    # --------------------------------------- query keys (v0.6, opt-in query_keys)
+    def _attach_key(
+        self, unit: Cognition, qe: tuple[float, ...], span_text: str, read_id: str
+    ) -> None:
+        """Attach one PROVISIONAL query key (optimistic-attach: it retrieves immediately,
+        no confirmation wait). Cap: at most _MAX_KEYS_PER_UNIT keys per unit — the newcomer
+        always lands; the lowest-hits EXISTING key (ties: oldest) is evicted instead."""
+        texts, _ = self._atomic_rows(unit)
+        claim_idx = next((i for i, t in enumerate(texts) if t == span_text), -1)
+        keys = list(unit.query_keys)
+        keys.append(QueryKey(embedding=qe, claim_idx=claim_idx,
+                             span_text=span_text, hits=0, read_id=read_id))
+        if len(keys) > _MAX_KEYS_PER_UNIT:
+            evict = min(range(len(keys) - 1), key=lambda i: (keys[i].hits, i))
+            keys.pop(evict)
+        unit.query_keys = tuple(keys)
+        self._keys_by_read.setdefault(read_id, []).append(unit.id)
+        self._key_gen += 1
+        self._emit("key_attached", unit_id=unit.id, provisional=True)
+
+    def _expire_provisional_keys(self, read_id: str) -> None:
+        """A read aged out of the ring: its never-confirmed keys go with it (the confirmed
+        ones — read_id already cleared — stay durable on the unit)."""
+        for uid in self._keys_by_read.pop(read_id, []):
+            unit = self._units.get(uid)
+            if unit is None:
+                continue
+            kept = tuple(k for k in unit.query_keys if k.read_id != read_id)
+            if len(kept) != len(unit.query_keys):
+                unit.query_keys = kept
+                self._key_gen += 1
+
+    def _rebind_keys(self, unit: Cognition) -> None:
+        """Re-point each key at its claim row by the promoted fact's TEXT identity (claim
+        positions regenerate on every rebuild; the text is the durable binding). A key whose
+        fact is not (yet) a verbatim claim stays span-level (claim_idx -1, inert as a row)."""
+        if not unit.query_keys:
+            return
+        texts, _ = self._atomic_rows(unit)
+        pos = {t: i for i, t in enumerate(texts) if t}
+        for key in unit.query_keys:
+            key.claim_idx = pos.get(key.span_text, -1)
+
+    def _query_key_rows(
+        self, ns: str
+    ) -> tuple[list[tuple[str, int, str, QueryKey]], Any]:
+        """(owner_id, row_idx, row_text, key) rows over FRESH units' keys (provisional AND
+        confirmed — optimistic-attach serves immediately) plus the numpy matrix — lazily
+        built, keyed like the span state with ``_key_gen`` added so an attach/expiry/
+        eviction refreshes it without a rows-epoch bump.
+
+        A claim-bound key (claim_idx >= 0) serves its CLAIM text. A span-level key
+        (claim_idx == -1 — the promoted fact is not yet a claim, which is the NORMAL state
+        for a behaviorally-attached key, since spans are captured precisely because their
+        facts are absent from every claim) serves its own SPAN TEXT: that sentence is
+        exactly the content that rescued the verified refusal round-trip, so serving it on
+        key fire is serving behavior-verified content. Span rows get DISTINCT negative
+        sentinel indices per unit so multiple span-level keys never collide on the
+        (unit, idx) identity downstream."""
+        marker = (ns, self._rows_epoch, self._status_gen, self._key_gen)
+        state = self._key_state
+        if state is not None and state[0] == marker:
+            return state[1], state[2]
+        rows: list[tuple[str, int, str, QueryKey]] = []
+        dim = 0
+        for uid, u in self._units.items():
+            if u.namespace != ns or not u.is_fresh or not u.query_keys:
+                continue
+            texts, _embs = self._atomic_rows(u)
+            sentinel = 0                         # -1, -2, ... per span-level key of this unit
+            for key in u.query_keys:
+                if not key.embedding or not any(key.embedding):
+                    continue
+                if 0 <= key.claim_idx < len(texts) and texts[key.claim_idx]:
+                    row_idx, row_text = key.claim_idx, texts[key.claim_idx]
+                elif key.span_text:
+                    sentinel -= 1
+                    row_idx, row_text = sentinel, key.span_text
+                else:
+                    continue
+                if dim == 0:
+                    dim = len(key.embedding)
+                if len(key.embedding) == dim:
+                    rows.append((uid, row_idx, row_text, key))
+        matrix: Any = None
+        if _np is not None and rows:
+            m = _np.asarray([k.embedding for _, _, _, k in rows], dtype=_np.float64)
+            n = _np.linalg.norm(m, axis=1, keepdims=True)
+            matrix = m / _np.where(n > 0, n, 1.0)
+        self._key_state = (marker, rows, matrix)
+        return rows, matrix
+
+    def _apply_query_keys(
+        self,
+        ns: str,
+        qe: tuple[float, ...],
+        fresh_rows: list[tuple[float, ClaimRef]],
+        masked: set[str],
+        fired: set[int],
+    ) -> list[tuple[float, ClaimRef]]:
+        """The key overlay on the pool scan (the MATCH RULE): a key row's similarity counts
+        ONLY at/above ``key_floor`` — below it the row is ignored entirely, so keys never
+        compete at low similarity (the v0.2-regression guard). A claim's serving score
+        becomes max(content_sim, qualifying key_sim): its row is raised in place or injected
+        when the scan missed it; content rows are never displaced, and dedup never sees a
+        separate key row (one row per claim, key-boosted). Idempotent — safe to re-apply
+        after a rebuild re-scan; ``fired`` de-dupes key_fired/hits within one read."""
+        if not self._query_keys:
+            return fresh_rows
+        rows, matrix = self._query_key_rows(ns)
+        if not rows:
+            return fresh_rows
+        sims = self._score_vectors(matrix, [k.embedding for _, _, _, k in rows], qe)
+        best: dict[tuple[str, int], tuple[float, str, QueryKey]] = {}
+        for (uid, cidx, text, key), sim in zip(rows, sims):
+            if sim < self._key_floor or uid in masked:
+                continue                         # ignored ENTIRELY below the floor
+            prior = best.get((uid, cidx))
+            if prior is None or sim > prior[0]:
+                best[(uid, cidx)] = (sim, text, key)
+        if not best:
+            return fresh_rows
+        out: list[tuple[float, ClaimRef]] = []
+        for score, ref in fresh_rows:
+            hit = best.pop((ref.unit_id, ref.claim_idx), None)
+            if hit is not None and hit[0] > score:
+                score = hit[0]                   # raised in place: max(content, key)
+                self._fire_key(hit[2], ref.unit_id, hit[0], fired)
+            out.append((score, ref))
+        for (uid, cidx), (sim, text, key) in best.items():
+            out.append((sim, ClaimRef(uid, cidx, text)))   # the scan missed it: inject
+            self._fire_key(key, uid, sim, fired)
+        out.sort(key=lambda r: (-r[0], r[1].unit_id, r[1].claim_idx))
+        return out
+
+    def _fire_key(self, key: QueryKey, unit_id: str, sim: float, fired: set[int]) -> None:
+        """One key changed a read's outcome (raised or injected its claim): count the hit
+        (eviction keeps proven keys) and emit ``key_fired`` — once per key per read."""
+        if id(key) in fired:
+            return
+        fired.add(id(key))
+        key.hits += 1
+        self._emit("key_fired", unit_id=unit_id, key_sim=round(sim, 4))
+
+    def _serve_residual_spans(
+        self,
+        ns: str,
+        qe: tuple[float, ...],
+        claim_sim: float,
+        picked: list[_PoolHit],
+        headers: dict[str, str],
+        est_used: int,
+    ) -> tuple[list[tuple[str, str]], int, dict[str, str]]:
+        """The side channel (zero pool crowding): score the fresh units' tier-2 spans against
+        the query IN MEMORY (never a retrieval — the single-retrieval invariant holds) and,
+        under the RANKING-ANOMALY RULE — span similarity strictly above the best fresh CLAIM
+        similarity + ``span_margin`` — append up to ``_SPANS_PER_READ`` labeled spans to the
+        served payload, inside the SAME ``serve_budget`` accounting (a new group's header is
+        costed like the packer does; a span that does not fit is not served). Every span serve
+        emits ``residual_served`` and counts one lossy signal against its owner."""
+        rows, matrix = self._residual_span_rows(ns)
+        if not rows:
+            return [], est_used, headers
+        sims = self._score_spans(rows, matrix, qe)
+        order = sorted(range(len(rows)),
+                       key=lambda i: (-sims[i], rows[i][0], rows[i][1].chunk_idx))
+        served: list[tuple[str, str]] = []
+        served_texts = {h.text for h in picked}
+        out_headers = headers
+        opened = set(headers)                 # groups whose open + header are already paid for
+        budget = self._serve_budget
+        for i in order:
+            if len(served) >= _SPANS_PER_READ:
+                break
+            if sims[i] <= claim_sim + self._span_margin:
+                break                         # sorted desc: no anomaly below this point
+            uid, span = rows[i]
+            if span.text in served_texts:
+                continue                      # already served verbatim as a claim
+            cost = _est_tokens("- " + _SPAN_LABEL + " " + span.text)
+            header = out_headers.get(uid, "")
+            if uid not in opened:
+                header = self._pool_header_text(uid)
+                cost += 1                     # the group separator/open
+                if header:
+                    cost += _est_tokens(header) + 1
+            if est_used + cost > budget:
+                break                         # a bonus net never overruns the budget
+            if uid not in opened:
+                if out_headers is headers:
+                    out_headers = dict(headers)
+                out_headers[uid] = header
+                opened.add(uid)
+            est_used += cost
+            served.append((uid, span.text))
+            served_texts.add(span.text)
+            self._emit("residual_served", unit_id=uid,
+                       span_sim=round(sims[i], 4), claim_sim=round(claim_sim, 4))
+            unit = self._units.get(uid)
+            if unit is not None:
+                self._bump_lossy(unit, "span_hits")
+        return served, est_used, out_headers
+
+    @staticmethod
+    def _pool_render_with_spans(
+        picked: list[_PoolHit], headers: dict[str, str], spans: list[tuple[str, str]]
+    ) -> str:
+        """:meth:`_pool_render` plus the side channel: each served span renders as a labeled
+        line UNDER its owner's group (attribution preserved); a span whose owner served no
+        claims opens its own attributed group at the end."""
+        order_of: list[str] = []
+        lines: dict[str, list[str]] = {}
+        for hit in picked:
+            if hit.unit_id not in lines:
+                lines[hit.unit_id] = []
+                order_of.append(hit.unit_id)
+            lines[hit.unit_id].append("- " + hit.text)
+        for uid, text in spans:
+            if uid not in lines:
+                lines[uid] = []
+                order_of.append(uid)
+            lines[uid].append("- " + _SPAN_LABEL + " " + text)
+        parts: list[str] = []
+        for uid in order_of:
+            head = headers.get(uid, "")
+            body = "\n".join(lines[uid])
+            parts.append((head + "\n" + body) if head else body)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _attributed_raw(chunks: list[Chunk]) -> list[str]:
+        """Raw payload entries with their source attribution line (measured finding:
+        escalation raw was as outlet-blind as the pool payload was) — the same
+        ``[source: ...]`` format the default pool header uses, straight from each chunk's
+        own artifact_id; a chunk with no artifact stays bare."""
+        return [f"[source: {c.artifact_id}]\n{c.text}" if c.artifact_id else c.text
+                for c in chunks]
+
+    def _floor_pack(self, chunks: list[Chunk]) -> list[Chunk]:
+        """P7 raw payload: deduplicated, packed to <= serve_budget est. tokens — but never
+        fewer than one chunk (the floor must floor)."""
+        out: list[Chunk] = []
+        seen: set[tuple[str, str]] = set()
+        used = 0
+        for c in chunks:
+            key = (c.artifact_id, c.text)
+            if key in seen:
+                continue
+            seen.add(key)
+            cost = _est_tokens(c.text)
+            if out and used + cost > self._serve_budget:
+                break
+            out.append(c)
+            used += cost
+        return out
 
     def _emit(self, kind: str, **fields: Any) -> None:
         """Deliver one structured freshness event to the ``on_event`` hook (v0.5). The hook
@@ -1457,6 +3066,81 @@ class SemanticCache:
         """The 'widen retrieval' tool: fetch fresh evidence for a query."""
         return self._retriever.retrieve(query, namespace=namespace)
 
+    def report_refusal(self, read_id: str) -> str | None:
+        """The behavioral residual-span fallback (v0.6, requires ``residual_spans=True``) —
+        the PRIMARY tier-2 serving trigger: rank at serve time is a guess, a refusal is
+        evidence. When YOUR answerer refuses over a read's served payload, hand back that
+        read's ``Result.read_id``; the cache re-scores the namespace's residual spans against
+        the ORIGINAL query embedding and, when the best span clears ``span_serve_floor``,
+        returns a RETRY PAYLOAD — up to 2 attributed ``[source excerpt]`` lines (spans the
+        refused payload already contained are skipped) to append to the original context for
+        one retry call. Each returned span counts a lossy signal against its owning unit
+        exactly like the anomaly serve path, and emits ``residual_fallback``.
+
+        Returns ``None`` (emitting nothing) when no span qualifies, when the read_id is
+        unknown or has aged out of the ring buffer, or when the feature is off — never
+        raises. In-memory only: no retrieval, no LLM call."""
+        if not self._residual_spans:
+            return None
+        rec = self._read_log.get(read_id)
+        if rec is None:
+            return None
+        qe, ns, _served_units, served_span_texts, _est_used, _budget = rec
+        rows, matrix = self._residual_span_rows(ns)
+        if not rows:
+            return None
+        sims = self._score_spans(rows, matrix, qe)
+        order = sorted(range(len(rows)),
+                       key=lambda i: (-sims[i], rows[i][0], rows[i][1].chunk_idx))
+        chosen: list[tuple[str, str]] = []
+        headers: dict[str, str] = {}
+        seen = set(served_span_texts)
+        for i in order:
+            if len(chosen) >= _SPANS_PER_READ:
+                break
+            if sims[i] < self._span_serve_floor:
+                break                     # sorted desc: nothing below clears the floor
+            uid, span = rows[i]
+            if span.text in seen:
+                continue                  # the refused payload already carried it
+            seen.add(span.text)
+            chosen.append((uid, span.text))
+            headers.setdefault(uid, self._pool_header_text(uid))
+            self._emit("residual_fallback", read_id=read_id, unit_id=uid,
+                       span_sim=round(sims[i], 4))
+            unit = self._units.get(uid)
+            if unit is not None:
+                self._bump_lossy(unit, "span_hits")   # the behavioral residual-hit
+                if self._query_keys:
+                    # Optimistic-attach: the refused query's embedding becomes a PROVISIONAL
+                    # alternate key on the span's owner — retrieving immediately, confirmed
+                    # durable by report_success, expiring with the ring otherwise.
+                    self._attach_key(unit, qe, span.text, read_id)
+        if not chosen:
+            return None
+        return self._pool_render_with_spans([], headers, chosen)
+
+    def report_success(self, read_id: str) -> None:
+        """The symmetric half of the behavioral channel (requires ``query_keys=True``):
+        call it when the retry over a :meth:`report_refusal` payload SUCCEEDED. It CONFIRMS
+        that read's provisional query keys — they stop expiring with the read ring and
+        persist on their units (serde) — and emits ``key_confirmed`` per unit. Unknown or
+        expired read_id, or a read that attached no keys: a silent no-op, never raises."""
+        if not self._query_keys:
+            return
+        for uid in self._keys_by_read.pop(read_id, []):
+            unit = self._units.get(uid)
+            if unit is None:
+                continue
+            confirmed = False
+            for key in unit.query_keys:
+                if key.read_id == read_id:
+                    key.read_id = ""          # confirmed: durable, ring-expiry-proof
+                    confirmed = True
+            if confirmed:
+                self._emit("key_confirmed", unit_id=uid)
+                self._persist(unit)
+
     # ------------------------------------------- provenance + entity indexes
     def _reindex(self, unit: Cognition) -> None:
         for index in (self._artifact_index, self._entity_index):
@@ -1536,7 +3220,7 @@ class SemanticCache:
                 self._evict(unit_id)
                 result.deleted.append(unit_id)
             elif self._content_changed(unit, event):
-                unit.mark_dirty()
+                self._dirty(unit)
                 self._persist(unit)
                 result.dirtied.append(unit_id)
             else:
@@ -1569,7 +3253,7 @@ class SemanticCache:
         return self.invalidate(ChangeEvent(artifact_id=artifact_id, kind="delete"))
 
     def _evict(self, unit_id: str) -> None:
-        self._units.pop(unit_id, None)
+        unit = self._units.pop(unit_id, None)
         for index in (self._artifact_index, self._entity_index):
             for key, unit_ids in list(index.items()):
                 unit_ids.discard(unit_id)
@@ -1577,6 +3261,11 @@ class SemanticCache:
                     del index[key]
         if self._store is not None:
             self._store.delete(unit_id)
+        self._rows_epoch += 1     # the unit's claim rows were removed — monotone
+        if unit is not None and self._read_path == "pool":
+            idx = self._existing_index(unit.namespace)
+            if idx is not None:
+                idx.remove(unit_id)   # a deleted source's claims must never resurrect
 
     # --------------------------------------------------- time-based freshness
     def _refresh_if_expired(self, unit: Cognition) -> None:
@@ -1587,7 +3276,7 @@ class SemanticCache:
         if self._clock() - unit.freshness_epoch <= policy.max_age:
             return
         if policy.revalidate is None:
-            unit.mark_dirty()  # no revalidator -> conservatively rebuild on read
+            self._dirty(unit)  # no revalidator -> conservatively rebuild on read
             self._persist(unit)
             return
         changed = False
@@ -1608,7 +3297,7 @@ class SemanticCache:
                 changed = True
                 break
         if changed:
-            unit.mark_dirty()
+            self._dirty(unit)
         else:
             self._mark_fresh(unit)  # content unchanged -> bump freshness, no rebuild
         self._persist(unit)
@@ -1631,7 +3320,7 @@ class SemanticCache:
     # ------------------------------------------------------------------ misc
     @staticmethod
     def cost_sensitive_floor(escalation_cost: float, miss_cost: float) -> float:
-        """v0.4 (M3) — derive ``coverage_floor`` from a COST trade-off instead of guessing a
+        """v0.4 — derive ``coverage_floor`` from a COST trade-off instead of guessing a
         constant: ``tau* = 1 - escalation_cost / miss_cost``. The dearer a WRONG answer
         (``miss_cost``) is relative to one extra retrieval (``escalation_cost``), the higher the
         floor → the more eagerly the cache escalates to the RAG floor. Pass the result as
@@ -1640,16 +3329,23 @@ class SemanticCache:
             return 0.0
         return round(max(0.0, min(1.0, 1.0 - escalation_cost / miss_cost)), 4)
 
-    def stats(self) -> dict[str, float | int | None]:
+    def stats(self) -> dict[str, Any]:
         """Cache size + read-time observability. ``escalation_rate`` is the fraction of
         cache HITS that fell back to fresh raw — a high value means the cached
-        understanding under-covers real queries (deepen it, or lower coverage_floor)."""
+        understanding under-covers real queries (deepen it, or lower coverage_floor).
+
+        Pool mode (``read_path="pool"``) adds the §4.5 keys — pool sizes/mask rate, the
+        effective gate + noise ceiling, and the serve/probe/admission/retrieval counters
+        that make gate miscalibration one dashboard number. ``avg/max_age_at_serve_s`` are
+        redefined in pool mode as the mean/max over reads of the MAX served-owner age.
+        ``tokens_saved`` on a pool hit credits the TOP-ranked served claim's owner only —
+        conservative, continuous with v0.5 accounting."""
         hits = self._reads_hit
         synth_tokens = self._synth_prompt_tokens + self._synth_completion_tokens
         avg_synth = synth_tokens / self._synth_calls if self._synth_calls else 0.0
         now = self._clock()
         fresh_ages = [max(now - u.freshness_epoch, 0.0) for u in self._units.values() if u.is_fresh]
-        return {
+        base: dict[str, Any] = {
             "units": len(self._units),
             "tracked_artifacts": len(self._artifact_index),
             "reads": self._reads_total,
@@ -1675,7 +3371,7 @@ class SemanticCache:
             "synth_cost": round(self._synth_cost, 6),
             "avg_synth_tokens": round(avg_synth, 1),
             "tokens_saved": self._tokens_saved,
-            # Effective operating thresholds/knobs, so the cost/risk point is observable (M3 tau*)
+            # Effective operating thresholds/knobs, so the cost/risk point is observable (tau*)
             # and a caller can confirm which additive mechanisms are actually active this run.
             "coverage_floor": self._coverage_floor,
             "recall_threshold": self._effective_recall_threshold(),
@@ -1684,3 +3380,33 @@ class SemanticCache:
             "select_floor": self._select_floor,
             "residual_floor": self._residual_floor,
         }
+        if self._read_path == "pool":
+            fresh_rows = 0
+            total_rows = 0
+            for u in self._units.values():
+                texts, embs = self._atomic_rows(u)
+                n = sum(1 for t, e in zip(texts, embs) if t and any(e))
+                total_rows += n
+                if u.is_fresh:
+                    fresh_rows += n
+            base.update({
+                "read_path": self._read_path,
+                "serve_budget": self._serve_budget,
+                "serve_gate": self._serve_gate,
+                "serve_gate_effective": round(self._effective_pool_gate(), 4),
+                "pool_noise_ceiling": round(self._pool_noise_ceiling, 4),
+                "pool_claims_fresh": fresh_rows,
+                "pool_claims_total": total_rows,
+                "pool_mask_rate": (round(1.0 - fresh_rows / total_rows, 3)
+                                   if total_rows else 0.0),
+                "pool_serves": self._pool_serves,
+                "probe_reads": self._probe_reads,
+                "admission_reuses": self._admission_reuses,
+                "retrievals": self._retrievals,
+                "rebuilds_by_read": self._rebuilds_by_read,
+                "builds_by_gap": self._builds_by_gap,
+                "avg_units_per_serve": (round(self._pool_units_sum / self._pool_payloads, 2)
+                                        if self._pool_payloads else 0.0),
+                "pool_scan_slow": self._pool_scan_slow,
+            })
+        return base

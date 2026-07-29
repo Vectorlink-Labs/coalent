@@ -25,6 +25,8 @@ from .semantic import (
     BaseVectorRetriever,
     Chunk,
     ChromaRetriever,
+    ClaimIndex,
+    ClaimRef,
     Cognition,
     CognitionStore,
     CompositeRetriever,
@@ -42,11 +44,14 @@ from .semantic import (
     JSONPassthroughSynthesizer,
     LLMProvider,
     LLMSynthesizer,
+    LocalClaimIndex,
     OpenAIEmbedder,
     PgVectorRetriever,
     QdrantRetriever,
+    QueryKey,
     RedisCognitionStore,
     Related,
+    ResidualSpan,
     Result,
     Retriever,
     SemanticCache,
@@ -76,7 +81,7 @@ from .events import (
     verify_github_signature,
 )
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 __all__ = [
     "__version__",
@@ -89,6 +94,11 @@ __all__ = [
     "Related",
     "InvalidationResult",
     "Cognition",
+    "QueryKey",
+    "ResidualSpan",
+    "ClaimIndex",
+    "ClaimRef",
+    "LocalClaimIndex",
     "Chunk",
     "Retriever",
     "Synthesizer",
