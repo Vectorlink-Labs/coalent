@@ -35,7 +35,9 @@ redis = ["redis>=5.0"]
 qdrant = ["qdrant-client>=1.7"]
 chroma = ["chromadb>=0.4"]
 pgvector = ["psycopg[binary]>=3.1"]
-dev = ["pytest>=7.0", "pytest-cov", "mypy>=1.8", "ruff>=0.4"]
+# ruff is capped: CI installs the newest release, and 0.16 enables new default rules the
+# tree is not yet formatted for (tracked as a follow-up lint modernization).
+dev = ["pytest>=7.0", "pytest-cov", "mypy>=1.8", "ruff>=0.4,<0.16"]
 
 [project.scripts]
 coalent = "coalent.cli:main"
