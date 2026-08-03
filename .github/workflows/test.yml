@@ -16,7 +16,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev,fast]"
       - run: ruff check src tests
-      - run: mypy src
+      # Analyze at the matrix interpreter's version: pip resolves per-version deps
+      # (numpy >= 2.5 is 3.12-only and its PEP 695 stubs cannot parse under a 3.10
+      # analysis target), so each job must type-check the world it actually installed.
+      - run: mypy src --python-version ${{ matrix.python-version }}
       - run: pytest tests/ -q
   zero-dep:
     runs-on: ubuntu-latest

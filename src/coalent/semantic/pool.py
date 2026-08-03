@@ -195,7 +195,7 @@ class LocalClaimIndex:
         if top_n <= 0 or not self._flat_embs:
             return []
         if self._use_numpy and self._matrix is not None:
-            q = _np.asarray(qe, dtype=_np.float32)
+            q: Any = _np.asarray(qe, dtype=_np.float32)
             norm = float(_np.linalg.norm(q))
             q = q / (norm if norm else 1.0)
             scores: list[float] = [float(s) for s in (self._matrix @ q).tolist()]

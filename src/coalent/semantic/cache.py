@@ -1014,7 +1014,7 @@ class SemanticCache:
     def _fast_scores(self, idx: tuple[Any, ...], qe: tuple[float, ...]) -> tuple[Any, Any, Any]:
         """(seed_sims, ue_sims, claim_sims) for one query — the only heavy math, vectorized."""
         _, _, SE, UE, _, _, CE, _, dim = idx
-        q = _np.asarray(qe if len(qe) == dim else (0.0,) * dim, dtype=_np.float64)
+        q: Any = _np.asarray(qe if len(qe) == dim else (0.0,) * dim, dtype=_np.float64)
         n = _np.linalg.norm(q)
         q = q / (n if n > 0 else 1.0)
         return SE @ q, UE @ q, (CE @ q if CE.shape[0] else _np.zeros(0))
@@ -1615,7 +1615,7 @@ class SemanticCache:
         state = self._pool_state
         if state is None or state[0] != marker:
             texts, owners, embs = self._pool_rows(ns)
-            matrix = None
+            matrix: Any = None
             if _np is not None and embs:
                 matrix = _np.asarray(embs, dtype=_np.float64)
                 matrix /= _np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9
@@ -1625,7 +1625,7 @@ class SemanticCache:
         if not texts:
             return ""
         if matrix is not None:
-            q = _np.asarray(qe, dtype=_np.float64)
+            q: Any = _np.asarray(qe, dtype=_np.float64)
             q /= _np.linalg.norm(q) + 1e-9
             order = [int(i) for i in _np.argsort(-(matrix @ q), kind="stable")]
         else:
@@ -1981,7 +1981,7 @@ class SemanticCache:
             total_rows += len(rows)
             mat: Any = rows
             if _np is not None:
-                m = _np.asarray(rows, dtype=_np.float64)
+                m: Any = _np.asarray(rows, dtype=_np.float64)
                 n = _np.linalg.norm(m, axis=1, keepdims=True)
                 mat = m / _np.where(n > 0, n, 1.0)
             by_ns.setdefault(u.namespace, []).append(
@@ -1994,7 +1994,7 @@ class SemanticCache:
             arts = probe.provenance.artifact_ids()
             best = 0.0
             if _np is not None:
-                q = _np.asarray(probe.query_embedding, dtype=_np.float64)
+                q: Any = _np.asarray(probe.query_embedding, dtype=_np.float64)
                 qn = float(_np.linalg.norm(q))
                 q = q / (qn if qn else 1.0)
             for uid, o_arts, mat in by_ns.get(probe.namespace, []):
@@ -2315,7 +2315,7 @@ class SemanticCache:
                     collapsed[(h.unit_id, h.claim_idx)] = (prior.unit_id, prior.claim_idx)
                     continue
                 if e is not None and len(e) == dim and mat_owner:
-                    v = _np.asarray(e, dtype=_np.float64)
+                    v: Any = _np.asarray(e, dtype=_np.float64)
                     n = float(_np.linalg.norm(v))
                     v = v / (n if n else 1.0)
                     sims = mat[: len(mat_owner)] @ v
@@ -2488,7 +2488,7 @@ class SemanticCache:
                     rows.append((uid, span))
         matrix: Any = None
         if _np is not None and rows:
-            m = _np.asarray([s.embedding for _, s in rows], dtype=_np.float64)
+            m: Any = _np.asarray([s.embedding for _, s in rows], dtype=_np.float64)
             n = _np.linalg.norm(m, axis=1, keepdims=True)
             matrix = m / _np.where(n > 0, n, 1.0)
         self._span_state = (marker, rows, matrix)
@@ -2501,7 +2501,7 @@ class SemanticCache:
         """Query cosine per stored vector — one matvec on the numpy path, the exact
         pure-python twin otherwise. Shared by the span side channel and the key overlay."""
         if matrix is not None:
-            q = _np.asarray(qe, dtype=_np.float64)
+            q: Any = _np.asarray(qe, dtype=_np.float64)
             n = float(_np.linalg.norm(q))
             q = q / (n if n else 1.0)
             return [float(s) for s in (matrix @ q).tolist()]
@@ -2640,7 +2640,7 @@ class SemanticCache:
                     rows.append((uid, row_idx, row_text, key))
         matrix: Any = None
         if _np is not None and rows:
-            m = _np.asarray([k.embedding for _, _, _, k in rows], dtype=_np.float64)
+            m: Any = _np.asarray([k.embedding for _, _, _, k in rows], dtype=_np.float64)
             n = _np.linalg.norm(m, axis=1, keepdims=True)
             matrix = m / _np.where(n > 0, n, 1.0)
         self._key_state = (marker, rows, matrix)
@@ -2910,7 +2910,7 @@ class SemanticCache:
         idx = self._fast_index()
         if idx is not None:
             _, uids, _, _, spans, _, CE, c_meta, dim = idx
-            S = _np.asarray([s for s in seeds if len(s) == dim], dtype=_np.float64)
+            S: Any = _np.asarray([s for s in seeds if len(s) == dim], dtype=_np.float64)
             if S.shape[0] and CE.shape[0]:
                 Sn = _np.linalg.norm(S, axis=1, keepdims=True)
                 S = S / _np.where(Sn > 0, Sn, 1.0)
