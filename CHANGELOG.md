@@ -3,6 +3,105 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.1]
+
+The distribution release: the 0.6.0 engine, now reachable from Claude Code / Cursor / any
+MCP client (the `coalent-mcp` server) and from any LangChain stack (the new
+`langchain-coalent` package).
+
+**Upgrading from 0.6.0 is additive-only.** No existing API, default, knob, or store format
+changes in any way: the release adds one module (`coalent.mcp`), one console script
+(`coalent-mcp`), one public method (`SemanticCache.has_source`), and re-pins the `mcp`
+extra to the current MCP SDK. A 0.6.0 user who upgrades and touches nothing gets 0.6.0
+behavior, byte for byte. No separate upgrade doc is needed — this paragraph is it.
+
+MCP-specific numbers below come from a 100-question validation run drawn from the same
+frozen rig as every 0.6.0 number (the 609-article news corpus, 605 held-out questions,
+gpt-4.1-mini answerer, strict grading).
+
+### Known limits (read this first)
+
+- **Folder mode trades accuracy for zero config — measured.** On the same 100 questions,
+  the zero-config `--watch` deployment scored **0.46** vs **0.71** for a factory-built
+  cache over a purpose-built vector retriever (40 vs 18 refusals). The gap is the cost of
+  the generic paragraph chunker plus on-demand keyhole builds, not a cache defect — and it
+  is why the bring-your-own-cache factory mode is the primary, documented-first mode.
+  Folder mode is the demo wedge.
+- **A just-added file is not instantly servable from a warm pool.** The serve gate can
+  honestly refuse a question about a brand-new source until a read triggers a build for
+  it (the pool has no claims from that file yet). Nothing stale is ever served — the gap
+  shows up as a refusal, never a wrong answer. `refresh()` plus a first query warms it.
+- **One writer per store (stdio).** Every stdio launch is its own process; pointing two
+  MCP client apps at the same `--store` path means two processes writing one SQLite file,
+  which is unsupported. For a shared cache across multiple agents or apps, run one
+  `--transport http` server — one long-lived process, one cache — which is the validated
+  configuration (see below).
+- **`--watch` alongside `--cache-factory` only invalidates — it never ingests.** The
+  folder scan fires `source_changed` for edited files, but your factory's retriever is
+  the only index; the events only line up when your `artifact_id`s equal the
+  watch-relative file paths.
+
+### Added
+
+- **The MCP server** — `coalent-mcp`, installed with `pip install "coalent[mcp]"` (add
+  `,openai` for folder mode). Serves fresh, attributed facts from a
+  provenance-invalidated cache to any MCP client, over stdio (default) or streamable
+  HTTP. Two deployment modes, one tool surface:
+  - **Bring-your-own-cache factory mode (`--cache-factory module:function`) — the
+    primary mode.** Your factory function returns a fully user-constructed
+    `SemanticCache`: your vector DB / retriever, your embedder, your LLM, every knob —
+    including `store=` for persistence and `pool_header=` for attribution. The server
+    adds protocol glue only, and that glue is measured to add **zero quality loss**: over
+    a real vector retriever, factory mode reproduced the library's own benchmark result
+    **byte-identically** — 0.710 accuracy on the 100-question validation run, identical
+    confidence intervals, 100/100 serves, zero errors, 98/100 answer payloads byte-equal
+    to the library run. Freshness is signal-driven: your ingestion pipeline calls the
+    `source_changed` tool. No `OPENAI_API_KEY` is demanded — your factory brings its own
+    models. Folder-mode flags (`--store`, `--budget`) are rejected loudly rather than
+    silently ignored.
+  - **Folder mode (`--watch DIR`) — the zero-config demo wedge.** Mounts the recommended
+    v0.6 deployment (`read_path="pool"`, residual spans, query keys, SQLite persistence)
+    over a directory of documents. Every `get_context` call rescans the watched files
+    (mtime + content hash) before serving, so you cannot get a stale answer after saving
+    a file; attribution ships the measured golden path automatically (`pool_header` =
+    `[path | modified YYYY-MM-DD]` — files have metadata, so the bare-header gap never
+    opens). An untouched folder restarts fully warm (persisted scan table). Requires
+    `OPENAI_API_KEY` and fails loudly without it — never degrading to the lexical
+    embedder. Its accuracy cost versus a factory cache is measured and documented above.
+  - **Freshness, verified at the answer level.** In validation, editing a watched source
+    flipped the very next read's answer (e.g. a cached top-speed fact served 143.7 mph
+    before the edit and 178.2 mph immediately after, with `staleness_prevented`
+    incrementing). Zero stale serves were observed across all validation runs.
+  - **HTTP transport (`--transport http`)** — the SDK's streamable HTTP: one long-lived
+    process, many concurrent agents, ONE shared cache (shared compounding, no store
+    races; a single lock serializes tool bodies, so two concurrent identical misses build
+    once). Validated: two concurrent clients over one shared cache matched the sequential
+    reference on all 20 reads — contexts and answers — with zero duplicate builds.
+    Optional bearer auth via the `COALENT_MCP_TOKEN` env var (a shared secret for
+    localhost / trusted networks; multi-tenant auth is deliberately out of scope).
+  - **Seven tools:** `get_context(query, budget?)` (the attributed, budget-packed payload
+    + a `read_id` handle), `report_refusal(read_id)` / `report_success(read_id)` (the
+    behavioral loop over MCP), `source_changed(artifact_id, text?)` (the BYO freshness
+    feed — unchanged content is hash-detected and skipped), `list_sources()`,
+    `cache_stats()`, `refresh()`.
+- **`SemanticCache.has_source(artifact_id) -> bool`** — true when any cached unit's
+  provenance depends on that artifact. The cheap pre-check for change-feed adapters (the
+  MCP server uses it to fire `source_changed` only for files some unit actually read);
+  additive public API.
+- **`langchain-coalent` 0.1.0** — a separate package
+  ([integrations/langchain-coalent](integrations/langchain-coalent)) making Coalent a
+  LangChain-native freshness/reuse layer, BYO-first: your existing LangChain VectorStore
+  (or retriever), `Embeddings`, and chat model become the cache's substrate unchanged.
+  `create_coalent_cache(vectorstore, llm=..., embeddings=...)` is the one-call entry;
+  `CoalentRetriever` is a drop-in `BaseRetriever` whose documents carry `read_id`,
+  `sources`, and `cache_hit` metadata; the refusal→repair loop ships as a runnable
+  LangGraph-shaped example. Depends only on `coalent>=0.6` + `langchain-core>=0.3`.
+
+### Changed
+
+- The `mcp` extra now pins `mcp>=2.0` — the server targets the current MCP SDK API.
+  (The extra previously existed as a placeholder; nothing imported it.)
+
 ## [0.6.0]
 
 v0.6 adds the claim-pool-first read path (`read_path="pool"`) and a default-OFF behavioral

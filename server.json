@@ -1,0 +1,63 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.vectorlink-labs/coalent",
+  "title": "Coalent",
+  "description": "Fresh, attributed facts from your sources — cached, and invalidated the moment a source changes.",
+  "repository": {
+    "url": "https://github.com/Vectorlink-Labs/coalent",
+    "source": "github"
+  },
+  "websiteUrl": "https://coalent.ai",
+  "version": "0.6.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "coalent",
+      "version": "0.6.1",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--with",
+          "value": "coalent[mcp,openai]",
+          "description": "Install the MCP SDK and OpenAI extras alongside the core package",
+          "isRequired": true
+        },
+        {
+          "type": "positional",
+          "value": "coalent-mcp",
+          "valueHint": "coalent-mcp",
+          "description": "The MCP server entry point (the coalent package also ships a separate `coalent` inspection CLI)"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--watch",
+          "description": "Directory of documents to serve in zero-config folder mode. Advanced deployments replace this with --cache-factory module:function to serve a user-constructed cache over their own vector DB / embedder / LLM (see the README).",
+          "format": "filepath",
+          "default": "./docs",
+          "isRequired": true
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "OPENAI_API_KEY",
+          "description": "Required in folder (--watch) mode for semantic embeddings (text-embedding-3-small) and build synthesis (gpt-4o-mini); the server exits loudly without it rather than degrade. Factory (--cache-factory) mode brings its own models and needs no key.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "COALENT_MCP_TOKEN",
+          "description": "Optional shared secret for --transport http: when set, every HTTP request must carry Authorization: Bearer <token>. Unused over stdio.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

@@ -3252,6 +3252,13 @@ class SemanticCache:
         """A source was removed: evict the units that depended on it."""
         return self.invalidate(ChangeEvent(artifact_id=artifact_id, kind="delete"))
 
+    def has_source(self, artifact_id: str) -> bool:
+        """True when any cached unit's provenance depends on ``artifact_id`` — the cheap
+        pre-check for change-feed adapters (e.g. the MCP watched-folder server), which
+        would otherwise fire ``source_changed`` for files no unit has ever read and trip
+        the loud matched-no-units wiring warning on every edit of an unread file."""
+        return artifact_id in self._artifact_index
+
     def _evict(self, unit_id: str) -> None:
         unit = self._units.pop(unit_id, None)
         for index in (self._artifact_index, self._entity_index):

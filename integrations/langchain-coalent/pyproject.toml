@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-coalent"
+version = "0.1.0"
+description = "LangChain integration for Coalent — use any LangChain VectorStore/retriever, embeddings, and chat model as the substrate of a provenance-invalidated cognitive cache."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Nisarg Pujara", email = "nisarg.pujara@vectorlinklabs.com" }]
+keywords = [
+  "langchain", "rag", "llm", "agents", "context", "cache", "provenance", "coalent",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+]
+# BYO-first: only the two substrates. NO langchain-community, NO langgraph.
+dependencies = [
+  "coalent>=0.6",
+  "langchain-core>=0.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "mypy>=1.8", "ruff>=0.4,<0.16"]
+
+[project.urls]
+Homepage = "https://github.com/Vectorlink-Labs/coalent"
+Repository = "https://github.com/Vectorlink-Labs/coalent"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/langchain_coalent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true

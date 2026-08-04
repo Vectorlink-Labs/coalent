@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "coalent"
-version = "0.6.0"
+version = "0.6.1"
 description = "A real-time, provenance-invalidated cognitive cache layer for AI agents and RAG."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,7 +27,9 @@ dependencies = []
 [project.optional-dependencies]
 fast = ["numpy>=1.24"]
 langgraph = ["langgraph>=0.2"]
-mcp = ["mcp>=1.0"]
+# mcp is pinned >=2.0: coalent.mcp targets the SDK's MCPServer API (renamed from the
+# 1.x FastMCP) and is tested against 2.x only — 1.x support would be an untested claim.
+mcp = ["mcp>=2.0"]
 openai = ["openai>=1.0"]
 anthropic = ["anthropic>=0.40"]
 server = ["fastapi>=0.110"]
@@ -41,12 +43,18 @@ dev = ["pytest>=7.0", "pytest-cov", "mypy>=1.8", "ruff>=0.4,<0.16"]
 
 [project.scripts]
 coalent = "coalent.cli:main"
+coalent-mcp = "coalent.mcp:main"
 
 [project.urls]
 Homepage = "https://github.com/Vectorlink-Labs/coalent"
 Repository = "https://github.com/Vectorlink-Labs/coalent"
 Documentation = "https://coalent.ai/docs"
 Issues = "https://github.com/Vectorlink-Labs/coalent/issues"
+
+[tool.hatch.build.targets.sdist]
+# integrations/ ships as its own PyPI package (langchain-coalent) — keep the
+# coalent sdist scoped to the library itself.
+exclude = ["integrations/", ".venv*", "*.log"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/coalent"]

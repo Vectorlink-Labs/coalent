@@ -25,6 +25,8 @@
   <a href="#whats-new-in-v06">What's new in v0.6</a> ·
   <a href="#the-read-path--a-ladder-of-gates">Gate ladder</a> ·
   <a href="#bring-your-own-stack">Bring your own stack</a> ·
+  <a href="#use-it-from-claude-code--cursor-mcp">MCP</a> ·
+  <a href="#langchain">LangChain</a> ·
   <a href="#benchmark">Benchmark</a> ·
   <a href="#cli">CLI</a>
 </p>
@@ -46,6 +48,8 @@ Every context layer is forced to trade off three things. Coalent is built to hol
 Coalent sits **above retrieval** — bring any retriever (vector DB, hybrid search, GraphRAG, tools, APIs). It's the freshness-and-reuse layer, not another retriever — deliberately the *opposite* of GraphRAG's build-the-whole-graph-upfront tax: **lightweight, independent units, built lazily only when a query actually needs one**, and refreshed by dirtying a single unit (no graph surgery).
 
 > **New in v0.6** — the **pool read path** (`read_path="pool"`): every read serves the token-budgeted, globally ranked fresh-claim pool. Measured on a 605-question news benchmark (strict grading): **0.731 accuracy @ 981 context tokens** — matching naive top-9 (0.711 @ 1,311) at **~25% fewer tokens**, and naive's best measured point (top-12: 0.731 @ 1,729) at **~43% fewer**. Plus a default-OFF **behavioral stack** — residual spans → refusal fallback → append-only repair → query keys — measured at **−33% refusals** and **+3.1 pts** on the same store. All opt-in; the default read path is unchanged v0.5 behavior. See [What's new](#whats-new-in-v06).
+>
+> **New in v0.6.1** — the **MCP server**: `coalent-mcp` puts the cache one line away from Claude Code, Cursor, or any MCP client ([Use it from Claude Code / Cursor](#use-it-from-claude-code--cursor-mcp)), and **[`langchain-coalent`](#langchain)** makes your existing LangChain stack the cache's substrate. Both additive-only.
 
 ## Install
 
@@ -272,6 +276,121 @@ from coalent import make_cognition_node, build_mcp_tools
 node = make_cognition_node(cache)     # a graph node: state -> { context: fresh understanding }
 tools = build_mcp_tools(cache)        # expose the cache as an MCP tool
 ```
+
+For the full standalone MCP server (freshness loop, seven tools, HTTP transport), see the
+[next section](#use-it-from-claude-code--cursor-mcp); for LangChain, see
+[langchain-coalent](#langchain).
+
+## Use it from Claude Code / Cursor (MCP)
+
+<!-- mcp-name: io.github.vectorlink-labs/coalent -->
+
+`coalent-mcp` serves fresh, attributed facts from a Coalent cache to any MCP client —
+and the facts are invalidated the instant their source changes. One line to wire it into
+Claude Code:
+
+```bash
+pip install "coalent[mcp,openai]"
+claude mcp add coalent -- coalent-mcp --cache-factory my_cache:build
+```
+
+(Cursor / Claude Desktop / any MCP client: register the same `coalent-mcp ...` command in
+its MCP config.)
+
+**Bring your own cache (`--cache-factory module:function`) — the primary mode.** Your
+factory returns a fully constructed `SemanticCache`: your vector DB, your embedder, your
+LLM, every knob. The server adds protocol glue only — and the glue is measured to add
+**zero quality loss**: factory mode reproduced the library's own benchmark result
+byte-identically (0.710 on a 100-question validation run drawn from our n=605 news
+benchmark — identical CIs, 100/100 serves, 98/100 answer payloads byte-equal to the
+library run).
+
+```python
+# my_cache.py — importable from the directory you launch in
+from coalent import (SemanticCache, LLMSynthesizer, OpenAIProvider,
+                     OpenAIEmbedder, SQLiteCognitionStore)
+
+def build() -> SemanticCache:
+    return SemanticCache(
+        my_vector_retriever,                  # YOUR vector DB / retriever
+        LLMSynthesizer(OpenAIProvider()),     # YOUR synthesis model
+        embedder=OpenAIEmbedder(),            # YOUR embedder
+        read_path="pool",
+        residual_spans=True, query_keys=True, # the behavioral stack, opt-in as ever
+        pool_header=my_metadata_header,       # [title | source | date] — the measured golden path
+        store=SQLiteCognitionStore("kb.db"),  # persistence is yours too
+    )
+```
+
+Freshness here is signal-driven: your ingestion pipeline calls the `source_changed` tool
+when a document changes and the affected facts invalidate immediately. (Adding
+`--watch DIR` alongside the factory also fires it on file edits — invalidation only; it
+never ingests into your index, and it matches only when your artifact ids equal the
+watch-relative paths.)
+
+**Zero-config folder mode (`--watch DIR`) — the demo wedge.** Point it at a folder of
+docs and you get the recommended v0.6 deployment (pool path, residual spans, query keys,
+SQLite persistence, automatic `[path | modified date]` attribution) with no code at all:
+
+```bash
+claude mcp add coalent --env OPENAI_API_KEY=$OPENAI_API_KEY -- coalent-mcp --watch ./docs
+```
+
+Every read rescans the watched files (mtime + content hash) before serving — you cannot
+get a stale answer after saving a file — and an untouched folder restarts fully warm.
+**The honest number:** on the same 100-question validation run, folder mode scored
+**0.46 vs 0.71** for a factory-built cache (40 vs 18 refusals) — the measured cost of the
+generic paragraph chunker and on-demand keyhole builds. Use it to feel the freshness loop
+in a minute; bring your own stack for production quality. One regime note: a question
+about a *just-added* file can honestly refuse from a warm cache until a read triggers
+that file's first build — a refusal, never a stale or wrong answer.
+
+**One shared cache for many agents (`--transport http`).**
+
+```bash
+COALENT_MCP_TOKEN=<secret> coalent-mcp --cache-factory my_cache:build --transport http --port 8765
+```
+
+One long-lived process, many concurrent MCP clients, ONE shared cache — shared
+compounding, no store races (validated: two concurrent clients matched the sequential
+reference on all 20 reads, zero duplicate builds). When `COALENT_MCP_TOKEN` is set, every
+request must carry `Authorization: Bearer <token>` — bind localhost or trusted networks.
+Corollary for stdio: each stdio launch is its own process, so never point two apps at the
+same `--store` path — HTTP mode *is* the shared-cache answer.
+
+**The seven tools:** `get_context(query, budget?)` → the attributed, budget-packed
+payload + a `read_id` · `report_refusal(read_id)` / `report_success(read_id)` → the
+behavioral repair loop over MCP · `source_changed(artifact_id, text?)` → the BYO
+freshness feed (unchanged content is hash-detected and skipped) · `list_sources()` ·
+`cache_stats()` · `refresh()`.
+
+## LangChain
+
+[`langchain-coalent`](integrations/langchain-coalent) makes Coalent a LangChain-native
+freshness/reuse layer — BYO-first: your existing VectorStore (or retriever), embeddings,
+and chat model become the cache's substrate, unchanged.
+
+```bash
+pip install langchain-coalent
+```
+
+```python
+from langchain_coalent import create_coalent_cache, CoalentRetriever
+
+cache = create_coalent_cache(my_vectorstore, llm=my_chat_model, embeddings=my_embeddings)
+retriever = CoalentRetriever(cache=cache)      # drop-in LangChain BaseRetriever
+
+docs = retriever.invoke("what is our leave policy?")
+docs[0].page_content              # the served, attributed context payload
+docs[0].metadata["read_id"]       # -> cache.report_refusal() / report_success()
+docs[0].metadata["cache_hit"]     # True == served with zero LLM spend
+
+cache.source_changed("policy.md", text=new_text)   # surgical, provenance-keyed invalidation
+```
+
+Every Coalent knob passes through `create_coalent_cache`; the refusal→repair loop ships
+as a runnable LangGraph-shaped example in the package. Depends only on `coalent>=0.6` and
+`langchain-core>=0.3`.
 
 ## Benchmark
 

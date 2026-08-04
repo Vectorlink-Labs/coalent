@@ -30,3 +30,22 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]"   # NO numpy: the pure-Python core must gate green alone
       - run: pytest tests/ -q
+  mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,fast,mcp,openai]"
+      - run: pytest tests/test_mcp_server.py -q
+  langchain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e . && pip install -e "integrations/langchain-coalent[dev]"
+      - run: pytest integrations/langchain-coalent/tests -q
+      - run: ruff check integrations/langchain-coalent/src
