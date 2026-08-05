@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.vectorlink-labs/coalent",
+  "name": "io.github.nisarg-pujara-vectorlink/coalent",
   "title": "Coalent",
   "description": "Fresh, attributed facts from your sources — cached, and invalidated the moment a source changes.",
   "repository": {

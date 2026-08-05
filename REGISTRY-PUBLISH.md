@@ -6,16 +6,16 @@ hosts **metadata only** — the artifact users install is the `coalent` package 
 PyPI always comes first.
 
 The manifest is [`server.json`](server.json) at the repo root
-(schema `2025-12-11`, validated). Server name: **`io.github.vectorlink-labs/coalent`**.
+(schema `2025-12-11`, validated). Server name: **`io.github.nisarg-pujara-vectorlink/coalent`**.
 
 ## Prerequisites (once per release)
 
 1. **`coalent 0.6.1` must be live on PyPI before publishing to the registry.** The
    registry validates the package exists and verifies ownership against it.
 2. **The ownership marker must be in the PyPI README.** The registry fetches the package's
-   PyPI description and requires the exact string `mcp-name: io.github.vectorlink-labs/coalent`
+   PyPI description and requires the exact string `mcp-name: io.github.nisarg-pujara-vectorlink/coalent`
    in it. It is already present in [README.md](README.md) as an HTML comment
-   (`<!-- mcp-name: io.github.vectorlink-labs/coalent -->` in the MCP section — PyPI
+   (`<!-- mcp-name: io.github.nisarg-pujara-vectorlink/coalent -->` in the MCP section — PyPI
    preserves HTML comments). Do not remove it; if the sdist/wheel README ever changes,
    re-check the marker survived.
 3. **A GitHub account in the `Vectorlink-Labs` org.** GitHub-based auth only permits
@@ -65,16 +65,16 @@ Expect:
 
 ```text
 ✓ Successfully published
-✓ Server io.github.vectorlink-labs/coalent version 0.6.1
+✓ Server io.github.nisarg-pujara-vectorlink/coalent version 0.6.1
 ```
 
 ## Step 4 — verify
 
 ```bash
-curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.vectorlink-labs/coalent"
+curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.nisarg-pujara-vectorlink/coalent"
 ```
 
-The response JSON should contain `"name":"io.github.vectorlink-labs/coalent"` with
+The response JSON should contain `"name":"io.github.nisarg-pujara-vectorlink/coalent"` with
 version `0.6.1`.
 
 ## Re-publishing a new version
@@ -88,6 +88,6 @@ existing version is rejected.
 
 | Error | Fix |
 | --- | --- |
-| "Registry validation failed for package" | The `mcp-name: io.github.vectorlink-labs/coalent` marker is missing from the **live PyPI** README (publish the PyPI release first / check the marker survived) |
+| "Registry validation failed for package" | The `mcp-name: io.github.nisarg-pujara-vectorlink/coalent` marker is missing from the **live PyPI** README (publish the PyPI release first / check the marker survived) |
 | "Invalid or expired Registry JWT token" | `mcp-publisher login github` again |
 | "You do not have permission to publish this server" | The logged-in GitHub account cannot publish under `io.github.vectorlink-labs/` — log in with an account in the org |

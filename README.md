@@ -116,7 +116,7 @@ Runnable no-API-key demo, including the refusal loop: [examples/pool_read_path.p
 
 ## Use it from Claude Code / Cursor (MCP)
 
-<!-- mcp-name: io.github.vectorlink-labs/coalent -->
+<!-- mcp-name: io.github.nisarg-pujara-vectorlink/coalent -->
 
 `coalent-mcp` serves fresh, attributed facts from a Coalent cache to any MCP client —
 and the facts are invalidated the instant their source changes. One line to wire it into
