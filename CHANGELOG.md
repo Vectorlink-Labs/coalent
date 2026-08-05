@@ -3,6 +3,11 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.2]
+
+Metadata-only patch: the MCP registry ownership marker in the README now matches the
+published registry namespace (`io.github.nisarg-pujara-vectorlink/coalent`). No code changes.
+
 ## [0.6.1]
 
 The distribution release: the 0.6.0 engine, now reachable from Claude Code / Cursor / any
