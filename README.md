@@ -501,6 +501,12 @@ pip install -e ".[dev]"
 pytest && ruff check src && mypy src
 ```
 
+One CI reality to know: the project pins mypy's analysis target to 3.10
+(`python_version` in `pyproject.toml`), but if numpy >= 2.5 is installed (what the
+`[fast]` extra resolves to on Python 3.12+), its stubs use syntax a 3.10 analysis
+target cannot parse. In that case run `mypy src --python-version 3.12` — matching
+your interpreter — exactly as the CI matrix does.
+
 ## Status &amp; license
 
 **Alpha** — the API may change before 1.0. Fully typed (`mypy --strict`), linted, and tested.
