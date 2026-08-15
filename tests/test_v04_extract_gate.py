@@ -14,6 +14,7 @@ The full ablation vs prose and the answer-correctness judging live in bench_extr
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 
@@ -21,9 +22,11 @@ import pytest
 
 pytestmark = pytest.mark.openai
 
+# Both the key AND the SDK: with a key exported but the openai package absent
+# (plain `pip install -e ".[dev]"`), these must SKIP, not crash on import.
 _needs_key = pytest.mark.skipif(
-    not os.environ.get("OPENAI_API_KEY"),
-    reason="the extract gate needs a real OPENAI_API_KEY",
+    not os.environ.get("OPENAI_API_KEY") or importlib.util.find_spec("openai") is None,
+    reason="the extract gate needs a real OPENAI_API_KEY and the openai SDK installed",
 )
 
 # A compact structured policy doc — the kind of reuse-heavy source the cache wins on.

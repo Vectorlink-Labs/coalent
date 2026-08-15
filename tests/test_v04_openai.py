@@ -10,15 +10,18 @@ cross-unit recall must recover the other.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 
 import pytest
 
 pytestmark = pytest.mark.openai
 
+# Both the key AND the SDK: with a key exported but the openai package absent
+# (plain `pip install -e ".[dev]"`), these must SKIP, not crash on import.
 _needs_key = pytest.mark.skipif(
-    not os.environ.get("OPENAI_API_KEY"),
-    reason="v0.4 accuracy tier needs OPENAI_API_KEY",
+    not os.environ.get("OPENAI_API_KEY") or importlib.util.find_spec("openai") is None,
+    reason="v0.4 accuracy tier needs OPENAI_API_KEY and the openai SDK installed",
 )
 
 DOCS = {
