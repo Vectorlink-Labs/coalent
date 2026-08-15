@@ -19,6 +19,8 @@ data/
 .ruff_cache/
 .coverage
 htmlcov/
+# 20MB registry-publisher binary — install locally per REGISTRY-PUBLISH.md, never commit
+mcp-publisher.exe
 
 # IDE / OS
 .vscode/
