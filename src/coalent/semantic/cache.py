@@ -1776,7 +1776,11 @@ class SemanticCache:
         cov0 = fresh_rows[0][0] if fresh_rows else 0.0
 
         # P4 — GATE (pre-rerank cosine only; a reranker can never influence this decision).
-        outcome = "reuse" if forced_serve else ("serve" if cov0 >= gate else "build")
+        # The gate arbitrates among candidates; ZERO fresh candidates is never a serve.
+        # Without the fresh_rows guard, an explicit serve_gate=0.0 on a cold/empty pool
+        # passes 0.0 >= 0.0 and serves empty forever, never triggering the gap build.
+        outcome = "reuse" if forced_serve else (
+            "serve" if fresh_rows and cov0 >= gate else "build")
         self._emit("pool_gate", coverage=round(cov0, 4), gate=round(gate, 4), outcome=outcome)
         if outcome != "build":
             self._pool_serves += 1

@@ -446,6 +446,30 @@ def test_pool_build_on_low_coverage() -> None:
     assert "gamma two" in r.understanding["claims"]
 
 
+def test_empty_pool_builds_even_at_zero_gate() -> None:
+    """serve_gate=0.0 (explicit-absolute) on a COLD pool: zero candidates is never a serve.
+
+    Regression: the P4 comparison cov0 >= gate passed as 0.0 >= 0.0 on an empty pool, so an
+    operator-pinned zero gate served empty forever and the gap build could never trigger. The
+    gate arbitrates among candidates; with no fresh rows the read must probe-build.
+    """
+    events: list[dict] = []
+    ret = InMemoryRetriever()
+    ret.add("src:a", "alpha value one")
+    cache = _pool(ret, serve_gate=0.0, on_event=events.append)
+
+    r1 = cache.get("alpha value one")
+    assert r1.cache_hit is False                       # first read BUILDS...
+    assert "alpha value one" in r1.understanding["claims"]   # ...and serves content, not empty
+    gates = [e for e in events if e["event"] == "pool_gate"]
+    assert gates[0]["outcome"] == "build"
+
+    r2 = cache.get("alpha one")                        # now there ARE candidates: 0.0 gate serves
+    assert r2.cache_hit is True
+    assert r2.understanding == {"claims": ["alpha value one"]}
+    assert [e["outcome"] for e in events if e["event"] == "pool_gate"] == ["build", "serve"]
+
+
 def test_reuse_channel_bypasses_gate() -> None:
     events: list[dict] = []
     ret = InMemoryRetriever()
