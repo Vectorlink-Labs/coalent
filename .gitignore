@@ -12,6 +12,10 @@ env/
 # Benchmark artifacts / local data
 data/
 *.diff
+# Benchmark-repro workdirs: the news corpus is NOT redistributable from this repo
+# (see benchmarks/news-n605/README.md) and results/stores are local artifacts.
+benchmarks/*/data/
+benchmarks/*/out/
 
 # Tooling
 .pytest_cache/

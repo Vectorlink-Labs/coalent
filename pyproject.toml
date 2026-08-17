@@ -53,8 +53,9 @@ Issues = "https://github.com/Vectorlink-Labs/coalent/issues"
 
 [tool.hatch.build.targets.sdist]
 # integrations/ ships as its own PyPI package (langchain-coalent) — keep the
-# coalent sdist scoped to the library itself.
-exclude = ["integrations/", ".venv*", "*.log"]
+# coalent sdist scoped to the library itself. benchmarks/ lives in the repo
+# (reproduction package), not in the pip artifact.
+exclude = ["integrations/", "benchmarks/", ".venv*", "*.log"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/coalent"]
