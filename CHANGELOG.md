@@ -119,6 +119,10 @@ grader-blind string artifacts to a judge, never auto-accept).
 - **MCP folder mode** now auto-wires ingest metadata for watched files (title = first
   markdown H1 else filename, source = relative path, date = mtime), so its attribution
   header upgrades to the measured `[title | path | date]` rung automatically.
+- **Boundary surfaces**: the MCP server's `get_context` result and the
+  `langchain-coalent` retriever's document metadata now carry the read's
+  `coverage`, `needs_retrieval`, and `gaps` — additive keys, so an agent framework
+  on either integration can drive the failure chain without touching the Python API.
 
 ### Changed
 
