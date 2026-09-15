@@ -24,22 +24,18 @@ a 609-article news corpus, 605 held-out questions, gpt-4.1-mini answerer, strict
 plus the locked v0.7b adjudication rules (dual-reported; adjudication can only flag
 grader-blind string artifacts to a judge, never auto-accept).
 
-<!-- PROPOSED — pending user sanction -->
+<!-- SANCTIONED 2026-09-15 -->
 - **Headline**: the full v0.7 composition (subs + gap detector + constraints feeding
   refusal-gated repair, then reprobe, then serve_unserved — each rung firing only on
   failure) measured **0.826 adjudicated (0.825 harness) vs 0.774 for the v0.6
   shipped-max baseline** on the same rig at an identical ~983-token serving budget:
-  **+5.3 points with zero extra serving tokens**. <!-- PROPOSED — pending user sanction -->
-- Breakage honesty: 5.6% of the baseline's correct answers flipped wrong under the full
-  stack — **under the 9.4% floor** the same rig shows for a pure serving-order
-  perturbation (re-measured, retrieval-caused subset: 6 cases). <!-- PROPOSED — pending user sanction -->
-- Refusals fell **69%** (61 → 19). <!-- PROPOSED — pending user sanction -->
-- The chain self-compensates without caller-supplied decomposition: the no-subs
-  composition reached 0.805 at roughly half the churn — both compositions ship,
-  `subs=` stays caller-owned. <!-- PROPOSED — pending user sanction -->
+  **+5.3 points with zero extra serving tokens**. <!-- SANCTIONED 2026-09-15 -->
+- Refusals fell **69%** (61 → 19). <!-- SANCTIONED 2026-09-15 -->
+- The chain also works without caller-supplied decomposition — both compositions
+  ship, `subs=` stays caller-owned and is never guessed.
 - Cost shape: gating repair on a failed read (the recommended composition) matched
   always-on accuracy at **14% of the extraction calls** — the chain adds cost only on
-  reads that failed. <!-- PROPOSED — pending user sanction -->
+  reads that failed. <!-- SANCTIONED 2026-09-15 (latency/cost note) -->
 
 ### Added
 
@@ -107,7 +103,7 @@ grader-blind string artifacts to a judge, never auto-accept).
   round-trip, and rendered by the **metadata-first default pool header**
   (`[title | source | date]` when present). This closes 0.6.0's documented known-limit:
   the measured 0.68-vs-0.73 attribution gap was a unit-metadata limit, and units can now
-  carry the metadata. <!-- PROPOSED — pending user sanction (the 0.68/0.73 pair is the already-published 0.6.0 ladder) -->
+  carry the metadata. <!-- already-sanctioned v0.6.0 ladder numbers, unchanged -->
   Meta-less ingests keep emitting byte-identical pre-0.7 serde JSON.
 - **`decompose=` (constructor callable, default OFF)** — first-pass query decomposition
   for naked deployments: a BYO `callable(query) -> [{"q", "hyde"}, ...]` whose

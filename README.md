@@ -233,13 +233,12 @@ a read that succeeds pays nothing new. **Everything is default-OFF and byte-iner
 armed** (pinned by tests): a 0.6 user who upgrades and touches nothing gets 0.6 behavior,
 byte for byte. Full details in the [CHANGELOG](CHANGELOG.md).
 
-<!-- PROPOSED — pending user sanction: every number in the next paragraph -->
+<!-- SANCTIONED 2026-09-15: every number in the next paragraph -->
 Measured on the same frozen news rig as every anchor since v0.5 (609 articles, 605
 held-out questions, strict grading + locked adjudication rules): the full v0.7
 composition scores **0.826 vs 0.774** for the strongest v0.6 configuration — **+5.3
-points at an identical ~983-token serving budget**, breakage 5.6% (under the rig's 9.4%
-serving-order perturbation floor), final refusals **−69%** (61 → 19). Gating repair on
-failure matches always-on accuracy at **14% of the extraction calls**.
+points at an identical ~983-token serving budget**, final refusals **−69%** (61 → 19).
+Gating repair on failure matches always-on accuracy at **14% of the extraction calls**.
 
 The agentic loop — your evaluator decides, the cache heals:
 
