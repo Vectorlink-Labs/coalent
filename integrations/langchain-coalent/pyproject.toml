@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-coalent"
-version = "0.1.0"
+version = "0.2.0"
 description = "LangChain integration for Coalent — use any LangChain VectorStore/retriever, embeddings, and chat model as the substrate of a provenance-invalidated cognitive cache."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,7 @@ classifiers = [
 ]
 # BYO-first: only the two substrates. NO langchain-community, NO langgraph.
 dependencies = [
-  "coalent>=0.6",
+  "coalent>=0.7",
   "langchain-core>=0.3",
 ]
 

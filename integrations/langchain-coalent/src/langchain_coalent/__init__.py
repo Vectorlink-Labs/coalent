@@ -28,7 +28,7 @@ from .adapters import (
 from .factory import create_coalent_cache, default_pool_header
 from .retriever import CoalentRetriever, render_payload, sources_of
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
