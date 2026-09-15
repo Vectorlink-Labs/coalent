@@ -67,6 +67,34 @@ def test_page_content_and_version_round_trip() -> None:
     assert chunk.version == "7"  # coerced to str per Chunk contract
 
 
+def test_meta_maps_title_source_date() -> None:
+    # v0.7 ingest metadata: the three recognized keys copy into Chunk.meta (str-coerced);
+    # other metadata stays off the chunk (unchanged best-effort contract).
+    doc = Document("t", metadata={"title": "Q3 Policy", "source": "s:1",
+                                  "date": "2026-08-01", "author": "hr"})
+    chunk = document_to_chunk(doc)
+    assert chunk.meta == {"title": "Q3 Policy", "source": "s:1", "date": "2026-08-01"}
+
+
+def test_meta_source_falls_back_to_artifact_id() -> None:
+    # A doc with meta but no "source" key borrows the resolved artifact id — the natural
+    # source identity — so the header still names the source.
+    chunk = document_to_chunk(Document("t", metadata={"title": "T", "artifact_id": "a:1"}))
+    assert chunk.artifact_id == "a:1"
+    assert chunk.meta == {"title": "T", "source": "a:1"}
+
+
+def test_meta_absent_and_digest_guard() -> None:
+    # No title/source/date -> meta=None: the library's header ladder keeps its measured
+    # query-title rung instead of downgrading to an opaque id line.
+    assert document_to_chunk(Document("t", metadata={"artifact_id": "a:1"})).meta is None
+    assert document_to_chunk(Document("t")).meta is None
+    # The content-derived "chunk:" digest never leaks into meta["source"].
+    chunk = document_to_chunk(Document("just text", metadata={"title": "T"}))
+    assert chunk.artifact_id.startswith("chunk:")
+    assert chunk.meta == {"title": "T"}
+
+
 # --------------------------------------------------- CoalentVectorStoreRetriever
 def test_wraps_vectorstore(embeddings: BagOfWordsEmbeddings) -> None:
     vs = FakeVectorStore(embeddings)

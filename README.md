@@ -225,6 +225,87 @@ Every Coalent knob passes through `create_coalent_cache`; the refusal→repair l
 as a runnable LangGraph-shaped example in the package. Depends only on `coalent>=0.6` and
 `langchain-core>=0.3`.
 
+## What's new in v0.7
+
+The self-healing release. The read now ships its own doubt, and the cache gains an
+explicit failure chain your agent drives — each rung fires **only on a failed read**, so
+a read that succeeds pays nothing new. **Everything is default-OFF and byte-inert until
+armed** (pinned by tests): a 0.6 user who upgrades and touches nothing gets 0.6 behavior,
+byte for byte. Full details in the [CHANGELOG](CHANGELOG.md).
+
+<!-- PROPOSED — pending user sanction: every number in the next paragraph -->
+Measured on the same frozen news rig as every anchor since v0.5 (609 articles, 605
+held-out questions, strict grading + locked adjudication rules): the full v0.7
+composition scores **0.826 vs 0.774** for the strongest v0.6 configuration — **+5.3
+points at an identical ~983-token serving budget**, breakage 5.6% (under the rig's 9.4%
+serving-order perturbation floor), final refusals **−69%** (61 → 19). Gating repair on
+failure matches always-on accuracy at **14% of the extraction calls**.
+
+The agentic loop — your evaluator decides, the cache heals:
+
+```python
+cache = SemanticCache(
+    retriever, synthesizer, embedder=OpenAIEmbedder(),
+    read_path="pool",
+    gap_detector=True,               # observe-only: the read reports its own holes
+    repair_extractor=my_extractor,   # BYO callable(span, region, existing_claims) -> [claims]
+)
+
+r = cache.get(
+    question,
+    subs=planner_subquestions,       # your planner's decomposition (optional)
+    constraints={"dates": ["2023-10-05"], "sources": ["TechCrunch"]},  # intent metadata (optional)
+)
+answer = my_answerer(r.context["pool"])          # your model, your prompt
+r.sources                                        # artifact ids behind the payload
+r.max_source_age_s                               # freshness age of this serve
+r.gaps                                           # [{probe, span, source, kind}, ...] — the read's own doubt
+
+if failed(answer):                               # the failure chain — each rung ONLY on failure
+    cache.repair(r.read_id)                      # re-extract what the build missed — PERMANENT
+    r2 = cache.get(question, subs=planner_subquestions)   # repaired claims now compete
+    answer = my_answerer(r2.context["pool"])
+    if failed(answer):
+        r3 = cache.serve_unserved(r2.read_id)    # force-pack admitted-but-unserved claims
+        answer = my_answerer(r3.context["pool"]) if r3 else answer
+    if failed(answer):
+        r4 = cache.reprobe(r2.read_id)           # entity-probe re-rank of the same pool
+        answer = my_answerer(r4.context["pool"]) if r4 else answer
+```
+
+- **The read ships its own provenance and doubt.** `Result.sources` (the artifact ids
+  actually behind the payload), `Result.max_source_age_s` (the serve's freshness age),
+  and — with `gap_detector=True` — `Result.probes` / `probe_coverage` / `gaps`: per
+  probe, whether a raw evidence sentence outscores every claim (`extraction_hole` →
+  repair terrain) or nothing reaches the probe (`corpus_hole` → route to a tool).
+  Observe-only by construction: serving is byte-identical ON vs OFF (pinned), and the
+  sentence tier costs $0 at serve (lazy, embedded once, cached).
+- **`repair(read_id)` — the pump.** Consumes the read's banked gap and constraint
+  candidates plus bridge candidates near what served; one span-anchored BYO extractor
+  call per candidate (the library still never calls an LLM itself); mechanical near-dup
+  and defect rejection (antecedent-free pronoun subjects, truncated spans); then an
+  **append-only, provenance-stamped, permanent** store improvement — the cost is paid
+  once, every future read benefits. Returns a `RepairReport`.
+- **`serve_unserved(read_id)` and `reprobe(read_id, hint=None)` — the refusal rungs.**
+  Force-pack the claims that lost the packing race, or re-rank the unchanged pool with
+  entity probes harvested from what served. Embeds only — no LLM, no retrieval, no store
+  mutation — and by contract they run on refusals, so they cannot un-answer a correct
+  read.
+- **`subs=` / `constraints=` on `get()`.** Your planner hands the read its decomposition
+  (`subs=["...", ...]` — wins over the `decompose=` callable) and its metadata intent
+  (`constraints={"dates": ..., "sources": ..., "entities": ...}` — AND across keys, OR
+  within a key, falling back to OR rather than silencing a read). Constraints are a
+  **feeder only**: they bank repair candidates and never touch pool scoring or serving
+  (pinned).
+- **Ingest metadata closes the v0.6 attribution gap.** `retriever.add(..., meta={"title":
+  ..., "source": ..., "date": ...})` puts the metadata ON the unit (`source_meta`), and
+  the default pool header renders the measured `[title | source | date]` golden path
+  without the `pool_header` callable. Meta-less ingests are byte-identical to 0.6.
+- **Deprecation status:** the pool-path default flip pre-registered in 0.6.0 is **not
+  taken** in 0.7.0 (three of the five gates were not run), so `read_path="unit"` remains
+  the default, `serve="pool"` survives unchanged (its removal clock now counts from
+  whichever release takes the flip), and no unit-path knob warns yet.
+
 ## What's new in v0.6
 
 The pool-first release. Every n=605 number below comes from one frozen rig — a 609-article news corpus, 605 held-out questions, gpt-4.1-mini answerer, strict grading — the same rig the v0.5 numbers were measured on. Full details in the [CHANGELOG](CHANGELOG.md) and [UPGRADE-0.5-to-0.6.md](UPGRADE-0.5-to-0.6.md).

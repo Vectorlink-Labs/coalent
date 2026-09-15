@@ -3,6 +3,148 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0]
+
+v0.7 is the self-healing release. The read now ships its own doubt — an opt-in gap
+detector that says, per probe, "the source has this fact but my claims don't" — and the
+cache gains an explicit repair loop your agent drives: `repair(read_id)` re-extracts what
+a build missed and appends it **permanently** (every future read benefits; the cost is
+paid once), `reprobe(read_id)` re-ranks with entity probes when the answer is in the pool
+but buried, and `serve_unserved(read_id)` force-packs admitted-but-unserved claims after
+a refusal. Two upstream parameters (`subs=`, `constraints=`) let a planner hand the read
+its decomposition and its metadata intent instead of the cache guessing.
+
+**Everything below is default-OFF and byte-inert until armed** — a 0.6 user who upgrades
+and touches nothing gets 0.6 behavior, byte for byte (pinned by dedicated inertness
+tests on every knob). The default read path does **not** flip in 0.7 (see the flip-gate
+status at the bottom of this entry).
+
+Benchmark rig for the numbers below: the same frozen rig as every anchor since v0.5 —
+a 609-article news corpus, 605 held-out questions, gpt-4.1-mini answerer, strict grading,
+plus the locked v0.7b adjudication rules (dual-reported; adjudication can only flag
+grader-blind string artifacts to a judge, never auto-accept).
+
+<!-- PROPOSED — pending user sanction -->
+- **Headline**: the full v0.7 composition (subs + gap detector + constraints feeding
+  refusal-gated repair, then serve_unserved, then reprobe — each rung firing only on
+  failure) measured **0.826 adjudicated (0.825 harness) vs 0.774 for the v0.6
+  shipped-max baseline** on the same rig at an identical ~983-token serving budget:
+  **+5.3 points with zero extra serving tokens**. <!-- PROPOSED — pending user sanction -->
+- Breakage honesty: 5.6% of the baseline's correct answers flipped wrong under the full
+  stack — **under the 9.4% floor** the same rig shows for a pure serving-order
+  perturbation (re-measured, retrieval-caused subset: 6 cases). <!-- PROPOSED — pending user sanction -->
+- Refusals fell **69%** (61 → 19). <!-- PROPOSED — pending user sanction -->
+- The chain self-compensates without caller-supplied decomposition: the no-subs
+  composition reached 0.805 at roughly half the churn — both compositions ship,
+  `subs=` stays caller-owned. <!-- PROPOSED — pending user sanction -->
+- Cost shape: gating repair on a failed read (the recommended composition) matched
+  always-on accuracy at **14% of the extraction calls** — the chain adds cost only on
+  reads that failed. <!-- PROPOSED — pending user sanction -->
+
+### Added
+
+- **The agentic `Result` surface** — the read carries its own provenance and doubt so an
+  evaluator node can act without drilling:
+  - `Result.sources` — the artifact ids actually behind the served payload (served order
+    first, de-duplicated), on both read paths.
+  - `Result.max_source_age_s` — the serve's freshness age: MAX served-owner age in
+    seconds (the per-read form of the `stats()` aggregate).
+  - `Result.probes` / `Result.probe_coverage` — the probe texts this read scored (raw
+    query first) and, with the gap detector armed, per-probe
+    `{probe, best_claim, best_span, margin, fired}`.
+  - `Result.gaps` — the actionable subset: `{probe, span, unit_id, source, kind}` where
+    `kind` is `"extraction_hole"` (the evidence tier HAS it → repair terrain) or
+    `"corpus_hole"` (nothing reaches the probe → route to a tool/retrieval node).
+  - `Result.parent_read_id` — set on `reprobe()` / `serve_unserved()` results; `""` on
+    ordinary reads. (`Result.read_id` existed since 0.6.)
+- **`gap_detector=True`** (constructor knob, pool path) — observe-only by construction:
+  per probe, if a raw evidence sentence outscores every fresh claim by a fixed margin,
+  that sentence is banked as a repair candidate on the read's ledger and reported in
+  `Result.gaps`. Serving is byte-identical ON vs OFF (pinned). $0 at serve: the evidence
+  sentence tier hydrates lazily per unit, embeds once, and is cached.
+- **`get(..., subs=[...])`** — planner-owned decomposition: sub-question strings (or
+  `{"q", "hyde"}` dicts) feed the same probe-union path as the `decompose=` callable and
+  win over it for that read; `subs=[]` sanctions no-decomposition; malformed entries fail
+  open to the raw query.
+- **`get(..., constraints={...})`** — `{"dates": [...], "sources": [...],
+  "entities": [...]}` (intent detection's natural output) matched against unit ingest
+  metadata: dates through ONE ISO canonicalizer (never guessed), sources/entities
+  case-insensitive substring. **Feeder only**: matched units' best evidence sentences
+  join the read's repair-candidate ledger — constraints never touch pool scoring or
+  serving (pinned). With ≥2 derivable keys the match is **AND across keys / OR within a
+  key's values**; an empty AND set falls back to OR with a
+  `constraints_and_fallback` event, so the conjunction can narrow but never silence a
+  read's candidates.
+- **`repair(read_id)` + `repair_extractor=` (BYO callable)** — the pump. Consumes the
+  read's banked candidates (detector fires + constraints matches, best-first), then
+  bridge candidates derived from the served claims. Per candidate: one span-anchored
+  extractor call (`(span_text, context_region, existing_claims) -> [claims]` — the
+  library still never calls an LLM itself), mechanical near-dup rejection, then
+  **append-only commit with per-claim provenance**
+  (`understanding["_repair_provenance"]`: claim, span, source, origin, via, ts — a
+  wrong-but-novel claim stays evictable by inspection). Returns a `RepairReport`
+  (`candidates_seen / extracted / rejected / admitted / claims / units_touched`).
+  Capped at 8 admissions per call. The store improvement is permanent and persists
+  through the normal store path.
+- **Repair admission hygiene** — mechanically rejects (before dedup, counted in
+  `RepairReport.rejected`) the two measured span-extraction defect shapes: antecedent-free
+  pronoun-subject claims ("He was the richest…" with no proper noun anywhere) and
+  truncated claims (mid-sentence starts, dangling connectors, trailing punctuation cuts).
+- **`reprobe(read_id, hint=None)`** — the mechanical second pass for buried answers:
+  harvests proper-noun entities from the read's SERVED claims, pairs them with the
+  read's sub-question tails as new probes, one batched embed, then a MAX-union re-rank
+  over the unchanged pool (originals included — nothing served can score worse).
+  Fresh `Result` with `parent_read_id` set; embeds only, no LLM, no retrieval, no store
+  mutation. Self-skips (returns `None`) when there is nothing to harvest.
+- **`serve_unserved(read_id)`** — the post-repair refusal rung: a fresh `Result` that
+  force-packs, at the head, (a) the question's admitted-but-unserved repaired claims and
+  (b) the best claims of the strongest constraint-matched unit absent from the served
+  payload, then refills with the original served claims. One embed, no LLM, store never
+  mutated. By app contract, call it only on a refusal — a refusal is never a correct
+  answer, so this rung cannot break one.
+- **Ingest metadata** — `Chunk.meta` (recognized keys `title` / `source` / `date`,
+  extras preserved), captured onto the unit as `source_meta` at build, serialized
+  round-trip, and rendered by the **metadata-first default pool header**
+  (`[title | source | date]` when present). This closes 0.6.0's documented known-limit:
+  the measured 0.68-vs-0.73 attribution gap was a unit-metadata limit, and units can now
+  carry the metadata. <!-- PROPOSED — pending user sanction (the 0.68/0.73 pair is the already-published 0.6.0 ladder) -->
+  Meta-less ingests keep emitting byte-identical pre-0.7 serde JSON.
+- **`decompose=` (constructor callable, default OFF)** — first-pass query decomposition
+  for naked deployments: a BYO `callable(query) -> [{"q", "hyde"}, ...]` whose
+  sub-questions join the probe union (clamped at 4); an explicit `subs=` always wins.
+  The library never calls an LLM itself.
+- **New events**: `gap_detector`, `constraints_matched`, `constraints_and_fallback`,
+  `repair_applied`, `reprobe`, `reprobe_skipped`, `serve_unserved`,
+  `serve_unserved_skipped`, `pool_decomposed`.
+- **MCP folder mode** now auto-wires ingest metadata for watched files (title = first
+  markdown H1 else filename, source = relative path, date = mtime), so its attribution
+  header upgrades to the measured `[title | path | date]` rung automatically.
+
+### Changed
+
+- The default pool header is **metadata-first**: units whose ingests carried
+  `Chunk.meta` render `[title | source | date]`; meta-less units keep the 0.6 unit-title
+  fallback, and the construction warning now names the whole ladder. No behavior change
+  for corpora ingested without metadata.
+
+### Fixed
+
+- `OpenAIEmbedder.embed_many` now chunks requests at the provider's hard
+  2048-inputs-per-request limit (order preserved, minimum requests). An oversized batch
+  previously 400-failed and could silently degrade a feeder that expected one batched
+  call (pinned: 5000 texts → [2048, 2048, 904]).
+
+### v0.7 flip gates (pre-registered in 0.6.0) — status
+
+The 0.6.0 entry pre-registered five gates for flipping the default from
+`read_path="unit"` to `read_path="pool"` in v0.7. **The flip is not taken in 0.7.0**:
+gates (a) structured-template suite, (c) churn soak, and (d) the null suite were not
+run as pre-registered, so the default read path is unchanged and the pool path stays
+opt-in. Accordingly the deprecation clock has not started: `serve="pool"` (the v0.5
+preview) survives unchanged in 0.7 instead of being removed, the unit-path read knobs
+carry no `DeprecationWarning` yet, and the 3-month minimum-notice floor now counts from
+whichever future release takes the flip.
+
 ## [0.6.2]
 
 Metadata-only patch: the MCP registry ownership marker in the README now matches the

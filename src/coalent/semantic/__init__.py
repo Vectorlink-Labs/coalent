@@ -11,6 +11,7 @@ from .cache import (
     FreshnessPolicy,
     InvalidationResult,
     Related,
+    RepairReport,
     Result,
     SemanticCache,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "SemanticCache",
     "ContextStrategy",
     "FreshnessPolicy",
+    "RepairReport",
     "Result",
     "Related",
     "InvalidationResult",

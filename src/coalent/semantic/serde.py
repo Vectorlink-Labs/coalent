@@ -16,20 +16,27 @@ from .unit import Cognition, QueryKey, ResidualSpan
 
 
 def _chunk_to_dict(chunk: Chunk) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "artifact_id": chunk.artifact_id,
         "text": chunk.text,
         "version": chunk.version,
         "content_hash": chunk.content_hash,
     }
+    # v0.7 ingest metadata — written ONLY when set, so meta-less chunks keep emitting
+    # byte-identical pre-v0.7 JSON (and any older reader ignores the unknown key).
+    if chunk.meta:
+        out["meta"] = {str(k): str(v) for k, v in chunk.meta.items()}
+    return out
 
 
 def _chunk_from_dict(data: dict[str, Any]) -> Chunk:
+    meta = data.get("meta")
     return Chunk(
         artifact_id=data["artifact_id"],
         text=data["text"],
         version=data.get("version", ""),
         content_hash=data.get("content_hash", ""),
+        meta={str(k): str(v) for k, v in meta.items()} if isinstance(meta, dict) else None,
     )
 
 
@@ -116,6 +123,10 @@ def cognition_to_dict(unit: Cognition) -> dict[str, Any]:
         payload["span_hits"] = unit.span_hits
     if unit.lossy:
         payload["lossy"] = True
+    # v0.7 ingest metadata — same written-only-when-set contract as the v0.6 keys above:
+    # a store that never saw Chunk.meta keeps emitting byte-identical v0.6 JSON.
+    if unit.source_meta:
+        payload["source_meta"] = dict(unit.source_meta)
     # v0.6 query keys: CONFIRMED keys only (provisional ones expire with the in-process read
     # ring — never durable). Keys carry no text, so the embedding IS the key and must be
     # persisted (float-tuple style, capped at 8/unit by the cache — the size tradeoff).
@@ -151,6 +162,8 @@ def cognition_from_dict(data: dict[str, Any]) -> Cognition:
         ),
         span_hits=int(data.get("span_hits", 0)),
         lossy=bool(data.get("lossy", False)),
+        # v0.7 — absent in pre-v0.7 JSON: no ingest metadata (old dicts load fine).
+        source_meta={str(k): str(v) for k, v in (data.get("source_meta") or {}).items()},
         query_keys=tuple(
             QueryKey(
                 embedding=tuple(float(x) for x in k.get("embedding", [])),

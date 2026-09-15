@@ -7,7 +7,7 @@ model wrapper implements ``Synthesizer``. We never reimplement their search.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +18,10 @@ class Chunk:
     text: str
     version: str = ""           # native revision (Confluence version, git sha, ETag…)
     content_hash: str = ""      # optional; the cache hashes text when absent
+    meta: Mapping[str, str] | None = None   # v0.7 ingest metadata — recognized keys
+    #                                         title/source/date feed the built-in pool
+    #                                         attribution header; extras are preserved
+    #                                         on the unit but unused in v0.7
 
 
 @runtime_checkable

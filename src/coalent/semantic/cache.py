@@ -76,6 +76,96 @@ _POOL_GATE_MARGIN = 0.02
 _POOL_GATE_CEILING_MARGIN = 0.27  # adaptive gate ceiling = cov_default + 0.27
 _PUREPY_POOL_WARN_ROWS = 2000     # pure-python pool scan warning threshold
 
+# MECHANISM 2 (v0.7, PREREG-MECH2.md) — first-pass query decomposition. Operating point
+# is a module constant like the rest of the pool path (spec §2.2: delete tunables): the
+# BYO callable returns 2-4 sub-questions; anything beyond the cap is dropped.
+_DECOMPOSE_MAX_SUBS = 4           # sub-question probes per read (clamp, prereg contract)
+
+# v0.7 GAP DETECTOR (PIPELINE-DESIGN-v07 §THE STACK item 3 — lab arm C shipped as a
+# SIGNAL, never a server) — module constants, deliberately not tunables (spec §2.2).
+# The fire margin is the design doc's 0.02; the span source is the FULL evidence-sentence
+# tier (spec delta, residual-density sweep 2026-09-04: at residual density the detector is
+# DEAD — 0/130 fires survive, news_v2 carries no residual field — so the detector scores
+# the evidence sentences themselves, the tier the mech5 lab evidence measured), split by
+# the bench's established conventions: newline + sentence-punctuation regex, >= 20 chars.
+_GAP_DELTA = 0.02                 # span-over-claim fire margin (extraction_hole)
+_GAP_SENT_MIN_CHARS = 20          # evidence-sentence tier floor (the measured tier's)
+_GAP_LINE_SPLIT = re.compile(r"\n+")
+
+# v0.7 REPAIR (PIPELINE-DESIGN-v07 §THE STACK item 7, ``repair(read_id)``) — the pump:
+# span->claim conversion of the read's banked candidates. Module constants, not
+# tunables (spec §2.2). The dedup bar is the ONE near-dup rule (_SPAN_DEDUP_SIM).
+_REPAIR_CAP = 8                   # max new claims admitted per repair() call (permanence guard)
+_REPAIR_BRIDGE_K = 3              # bridge candidate spans derived at repair time (lab bridge_k)
+_REPAIR_BRIDGE_SEEDS = 5          # top served claims seeding the bridge (lab seeds_k; the
+#                                   audit: multi-seed union beyond the head is anti-power)
+_REPAIR_VIA = "repair@v1"         # per-claim provenance tag on every repaired claim
+
+# v0.7b REPAIR ADMISSION HYGIENE (LAB-displacement §5 defect ledger): the two banked
+# span-extraction defect shapes served at pack-head ranks 1-3 in the displacement
+# dissection — an antecedent-free pronoun-subject claim ("He was the richest person in
+# the world under 30", q346: the span-anchored extractor lost the referent) and a
+# truncated claim ("The Sporting News provided updates and highlights from Jaguars
+# vs.", q089). Both are rejected MECHANICALLY at repair admission, counted in
+# ``RepairReport.rejected``.
+_PRONOUN_SUBJECTS = frozenset({"he", "she", "it", "they", "this", "that"})
+_PROPER_NOUN = re.compile(r"\b[A-Z][A-Za-z]")   # any capitalized word beyond the first
+_TRUNC_TAILS = frozenset({
+    "vs", "v", "versus", "and", "or", "but", "of", "the", "a", "an", "with",
+    "from", "to", "at", "in", "on", "by", "for", "as", "per", "than"})
+_TRUNC_TAIL_PUNCT = (",", ":", ";", "-", "–", "—", "…")
+_LEAD_WORD = re.compile(r"[A-Za-z]+")
+
+# v0.7b SERVE-THE-UNSERVED (ROUND-COMPOSITION-VERDICT #3, ``serve_unserved(read_id)``)
+# — the post-repair refusal rung: force-pack what the chain ADMITTED or MATCHED but the
+# ranker never served (LAB-refusal-residue: all 15 retrieval-headroom refusals had the
+# gold unit IN STORE; q053/q327 had claims repaired FROM the missing gold doc admitted
+# but repaired_served=0 — a packing race, not a discovery problem).
+_UNSERVED_UNIT_CLAIMS = 8         # top claims force-packed from the ONE absent unit
+
+# v0.7 REPROBE (item 8, ``reprobe(read_id, hint)``) — ITER as an explicit method: the
+# arm-J mechanical conventions verbatim (proper-noun runs of >=2 capitalized tokens,
+# min length 5, question-token filtered, unit-diverse first; probes "<entity> — <tail>").
+_REPROBE_ENT = re.compile(r"(?:[A-Z][\w\-']+\s+)+[A-Z][\w\-']+s?")
+_REPROBE_ENT_MIN = 5              # shorter runs are initials/acronym noise (arm J bar)
+_REPROBE_ENTITY_CAP = 8           # entities harvested per reprobe (arm J cap)
+_REPROBE_PROBE_CAP = 12           # "<entity> — <tail>" probes per reprobe (arm J cap)
+_REPROBE_TAIL_Q = re.compile(r"\s*\?+\s*$")   # tail poison guard: trailing '?' strip
+
+# v0.7 CONSTRAINTS (PIPELINE-DESIGN-v07 §THE STACK item 2, ``constraints=`` on get()) —
+# the ONE date canonicalizer's forms: ISO ('YYYY-M-D', optional time tail) and
+# 'Month D, YYYY' (full month or an unambiguous >=3-letter prefix, optional period /
+# ordinal suffix / comma). Matching never guesses: anything else canonicalizes to "".
+_CANON_ISO = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s].*)?$")
+_CANON_MDY = re.compile(r"^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$")
+_MONTHS_FULL = ("january", "february", "march", "april", "may", "june", "july",
+                "august", "september", "october", "november", "december")
+
+
+def _canonical_date(raw: str) -> str:
+    """Normalize a date string to ISO ``YYYY-MM-DD`` — the ONE canonicalizer both sides
+    of a ``constraints={"dates": [...]}`` match go through (constraint values AND unit
+    ``source_meta`` date fields). Accepts ISO (with an optional time tail) and
+    'Month D, YYYY' forms; returns ``""`` for anything else, so an unparseable date can
+    never match anything (the metadata-fetch chain must never fire on a guess)."""
+    s = raw.strip()
+    m = _CANON_ISO.match(s)
+    if m:
+        y, mo, d = m.groups()
+        if 1 <= int(mo) <= 12 and 1 <= int(d) <= 31:
+            return f"{y}-{int(mo):02d}-{int(d):02d}"
+        return ""
+    m = _CANON_MDY.match(s)
+    if m:
+        name, d, y = m.groups()
+        low = name.lower()
+        for i, full in enumerate(_MONTHS_FULL, 1):
+            if low == full or (len(low) >= 3 and full.startswith(low)):
+                if 1 <= int(d) <= 31:
+                    return f"{y}-{i:02d}-{int(d):02d}"
+                return ""
+    return ""
+
 
 def _est_tokens(s: str) -> int:
     """The serving token estimate (~4 chars/token), never zero — the ONE estimator the
@@ -165,11 +255,60 @@ class Result:
     read_id: str = ""           # v0.6: this read's id — hand it to report_refusal() when YOUR
     #                             answerer refuses over the served payload (the behavioral
     #                             residual-span fallback; requires residual_spans=True)
+    # --- v0.7 read-surface readiness (PIPELINE-DESIGN-v07 §THE AGENTIC CONTRACT): the read
+    # ships its own provenance + doubt so an evaluator node can act without drilling. ---
+    sources: list[str] = field(default_factory=list)  # served sources: artifact ids behind the
+    #                             payload, served order first, de-duplicated (pool path: each
+    #                             served owner's evidence artifacts + any escalation raw; unit
+    #                             path: the served evidence's artifacts)
+    max_source_age_s: float = 0.0  # freshness age of the serve: MAX served-owner age in seconds
+    #                             (0.0 when nothing served) — the per-read freshness metadata
+    #                             the stats() aggregate already tracked internally
+    # --- v0.7 gap detector (opt-in ``gap_detector=True``; ALL empty when off — inert by
+    # construction). The read ships its own doubt: the one signal that fires WITHOUT a
+    # refusal, on the confident-wrong class where refusal-gated machinery is blind. ---
+    probes: list[str] = field(default_factory=list)  # the probe texts this read actually
+    #                             scored — raw query first, then the decompose/subs probes
+    probe_coverage: list[dict[str, Any]] = field(default_factory=list)  # per-probe
+    #                             {probe, best_claim, best_span, margin, fired} — best
+    #                             claim-pool cosine vs best evidence-sentence cosine
+    gaps: list[dict[str, Any]] = field(default_factory=list)  # the actionable subset:
+    #                             {probe, span, unit_id, source, kind} where kind is
+    #                             "extraction_hole" (the span tier HAS it -> repair
+    #                             terrain) or "corpus_hole" (neither tier reaches the
+    #                             probe -> route to a tool node)
+    parent_read_id: str = ""    # v0.7: set on a reprobe() Result — the read this
+    #                             second pass re-ranked; "" on every ordinary get()
 
     @property
     def raw_text(self) -> str:
         """The retained raw evidence as text — the detail the LLM may need."""
         return "\n\n".join(chunk.text for chunk in self.evidence)
+
+
+@dataclass(slots=True)
+class RepairReport:
+    """What one :meth:`SemanticCache.repair` call did — the pump's receipt.
+
+    ``candidates_seen`` counts the candidate spans considered (the read's banked
+    detector fires + constraints matches, plus the bridge candidates derived at repair
+    time, de-duplicated); ``extracted`` counts the claim strings the BYO extractor
+    returned across all calls; ``rejected`` counts extracted claims the mechanical
+    admission hygiene refused (v0.7b — antecedent-free pronoun subjects and truncated
+    claims, the LAB-displacement defect shapes); ``admitted`` counts the survivors of
+    the mechanical dedup that were appended to their owning units. ``claims`` carries
+    one provenance dict per admitted claim ({claim, unit_id, span, source, origin,
+    via, ts}) — the same record appended to the unit's
+    ``understanding["_repair_provenance"]``, so a wrong-but-novel claim stays
+    evictable by inspection."""
+
+    read_id: str = ""
+    candidates_seen: int = 0
+    extracted: int = 0
+    rejected: int = 0
+    admitted: int = 0
+    claims: list[dict[str, Any]] = field(default_factory=list)
+    units_touched: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -283,6 +422,9 @@ class SemanticCache:
         lossy_threshold: int = 2,
         query_keys: bool = False,
         key_floor: float = 0.85,
+        decompose: "Callable[[str], list[dict[str, Any]]] | bool" = False,
+        gap_detector: bool = False,
+        repair_extractor: "Callable[[str, str, list[str]], list[str]] | None" = None,
         strategy: str = ContextStrategy.CONTEXT_FIRST,
         store: CognitionStore | None = None,
         freshness: FreshnessPolicy | None = None,
@@ -365,14 +507,52 @@ class SemanticCache:
             # path — on the unit path keys could attach + confirm yet structurally never
             # fire (the exact silent-failure class a measured forensic run paid for).
             raise ValueError("query_keys requires read_path='pool'")
+        if decompose and not callable(decompose):
+            # Fail LOUD at construction: True (or any non-callable truthy) is a contract
+            # error — the library NEVER calls an LLM itself, so there is nothing sensible
+            # to arm without a BYO callable.
+            raise TypeError(
+                "decompose must be False or a callable(query) -> "
+                "[{'q': str, 'hyde': str | None}, ...] (the library never calls an LLM)"
+            )
+        if decompose and read_path != "pool":
+            # Same fail-LOUD contract as query_keys: the decomposition union scores only
+            # the pool scan — armed on the unit path the knob would be structurally inert
+            # (the silent-failure class a measured forensic run paid for).
+            raise ValueError("decompose requires read_path='pool'")
+        if gap_detector and read_path != "pool":
+            # Same fail-LOUD contract: the detector compares the CLAIM POOL against the
+            # evidence-sentence tier per probe — on the unit path there is no pool scan
+            # to compare, so the knob would be structurally inert. (SPEC DELTA logged:
+            # the design doc's residual_spans=True prerequisite is DROPPED — the
+            # residual-density sweep measured the residual tier dead as a span source,
+            # so the detector hydrates its own evidence-sentence tier instead and no
+            # longer depends on the residual machinery.)
+            raise ValueError("gap_detector requires read_path='pool'")
+        if repair_extractor is not None and not callable(repair_extractor):
+            # Same contract as decompose: the library NEVER calls an LLM itself, so a
+            # non-callable arm is a contract error, caught loud at construction.
+            raise TypeError(
+                "repair_extractor must be None or a callable"
+                "(span_text, context_region, existing_claims) -> [claim, ...] "
+                "(the library never calls an LLM)"
+            )
+        if repair_extractor is not None and read_path != "pool":
+            # Fail LOUD at construction (query_keys/decompose/gap_detector precedent):
+            # repair consumes the pool path's candidate ledger and appends pool rows —
+            # armed on the unit path the knob would be structurally inert.
+            raise ValueError("repair_extractor requires read_path='pool'")
         if read_path == "pool" and pool_header is None:
-            # Measured ladder (n=605 graded): bare default 0.68 vs metadata callable 0.73 —
+            # Measured ladder (n=605 graded): bare default 0.68 vs metadata header 0.73 —
             # the gap is source-identity questions honestly refusing. Warn, don't fail:
-            # the default header (unit title text) is legitimate when sources are homogeneous.
+            # v0.7's metadata rung closes the gap WITHOUT a callable when ingest supplies
+            # Chunk.meta, but the constructor cannot see whether the retriever will — so
+            # the gap must never be silent; ingest that does wire meta may ignore this.
             warnings.warn(
-                "read_path='pool' without pool_header: payload attribution falls back to unit "
-                "title text; per-source questions may refuse. Pass pool_header returning "
-                "'[title | source | date]' for full attribution (see the v0.6 upgrade guide).",
+                "read_path='pool' without pool_header: attribution uses the built-in ladder "
+                "(ingest Chunk.meta '[title | source | date]', else unit title text); without "
+                "meta, per-source questions may refuse. Supply Chunk.meta at ingest or pass "
+                "pool_header for guaranteed full attribution (see the v0.6 upgrade guide).",
                 stacklevel=2,
             )
         self._read_path = read_path
@@ -515,6 +695,57 @@ class SemanticCache:
         # floor the key row is ignored entirely (the v0.2-regression guard in the rule).
         self._query_keys = query_keys
         self._key_floor = key_floor
+        # MECHANISM 2 (v0.7, opt-in, OFF — PREREG-MECH2.md): FIRST-PASS QUERY
+        # DECOMPOSITION. When armed with a BYO callable (the library never calls an LLM
+        # itself — synth-pattern parity, zero-dep core preserved), each pool read asks the
+        # callable for 2-4 sub-questions (each optionally carrying a one-sentence
+        # hypothetical answer, HyDE-lite), embeds them ("<q> <hyde>" concat when the
+        # hypothetical is present; batched with the raw query into the read's ONE
+        # embedder call), and scores every claim as the MAX cosine over
+        # {raw query, all probes}. The raw query is ALWAYS in the union (Step-0 probe:
+        # sub-queries alone collapse the tail, p95 8,348 -> 16,078 — pre-refuted).
+        # Everything downstream is unchanged: same top-600 scan width, within-owner
+        # dedup, budget pack, gate, headers. First pass only — no build-path, behavioral-
+        # loop, or retry changes; runtime config, never persisted (serde-neutral). A
+        # failing/malformed callable degrades to the raw query with a logged warning
+        # (fail open, same contract as a broken BYO claim index — never crash the read).
+        self._decompose: Callable[[str], list[dict[str, Any]]] | None = (
+            decompose if callable(decompose) else None)
+        # v0.7 GAP DETECTOR (opt-in, OFF — PIPELINE-DESIGN-v07 arm C as a signal): during
+        # a pool read, compare each probe's best CLAIM-pool cosine against its best
+        # EVIDENCE-SENTENCE cosine; a span beating the claims by _GAP_DELTA is a measured
+        # extraction hole (fires Result.probe_coverage/gaps + banks repair candidates);
+        # both tiers weak = corpus hole (tool-routing terrain). Observes, NEVER packs —
+        # serving is byte-identical with the knob on (pinned). The sentence tier hydrates
+        # LAZILY per unit on first detector use (split + ONE batched embed, cached in a
+        # side store keyed unit id + evidence content hash — never at ingest); the side
+        # store is also the warm-cache seam a bench/driver may pre-seed. Fire quality
+        # wants decompose= or subs= armed (q-only under-fires: margin +0.004 vs +0.049
+        # q+hyde) — allowed but documented, per the design doc's open-question-4 call.
+        self._gap_detector = gap_detector
+        self._gap_sent_cache: dict[str, tuple[str, tuple[ResidualSpan, ...]]] = {}
+        self._gap_state: tuple[Any, ...] | None = None    # lazy per-ns rows+matrix (epoch-keyed)
+        # v0.7 repair-candidate ledger (in-memory, keyed read_id, its own ring cap):
+        # detector fires + constraints matches bank here; repair(read_id) consumes it.
+        self._read_bank: dict[str, list[dict[str, Any]]] = {}
+        # v0.7 REPAIR (opt-in via the BYO callable — item 7): span-anchored re-extraction
+        # of the read's banked candidates + repair-time bridge candidates, mechanical
+        # dedup, append-only claims with provenance. The library NEVER calls an LLM
+        # itself (synth/decompose seam parity); None = repair() raises loud.
+        self._repair_extractor = repair_extractor
+        # v0.7 second-pass read surface (in-memory, keyed read_id, same ring cap): what
+        # each pool read SERVED (owner+text refs, no vectors — the ring stays light) +
+        # its probe shape, so repair() can derive bridge candidates and reprobe() can
+        # harvest entities without re-reading. Observational only: recorded after
+        # pack/render, never an input to them (serving stays byte-identical — pinned
+        # by the whole existing suite).
+        self._read_meta: dict[str, dict[str, Any]] = {}
+        # v0.7b repair ring (in-memory, keyed by the repaired read_id, same ring cap):
+        # what repair() ADMITTED for a read's question ({query, ns, claims provs}), so
+        # serve_unserved() can find the chain's admitted-but-unserved repaired claims
+        # from a LATER read of the same question (the app's pass-2 get() has a new
+        # read_id — the join is (namespace, query), scan-bounded by the ring).
+        self._read_repairs: dict[str, dict[str, Any]] = {}
         self._key_gen = 0                                 # bumps on attach/expire/evict
         self._key_state: tuple[Any, ...] | None = None    # lazy per-ns key matrix
         self._keys_by_read: dict[str, list[str]] = {}     # read_id -> units holding its keys
@@ -650,6 +881,8 @@ class SemanticCache:
         namespace: str | None = None,
         related: int = 3,
         strategy: str | None = None,
+        subs: "list[str | dict[str, Any]] | None" = None,
+        constraints: dict[str, Any] | None = None,
     ) -> Result:
         """Fetch fresh, decision-ready context for a query. The one read method.
 
@@ -657,10 +890,40 @@ class SemanticCache:
         reachable via ``evidence`` / ``drill``). A cache hit that under-covers the
         query auto-escalates to fresh raw — no manual signal. ``related`` folds in
         up to N related units; ``strategy`` overrides the context payload policy.
+
+        v0.7 upstream params (pool path only; ``None`` = today's behavior, byte-inert):
+
+        ``subs`` — PLANNER-OWNED decomposition: sub-question strings (or
+        ``{"q", "hyde"}`` dicts) that feed the SAME probe-union path as the
+        ``decompose=`` callable and WIN over it for this read (explicit wins; the
+        callable stays the fallback for naked deployments). ``[]`` = explicitly no
+        decomposition.
+
+        ``constraints`` — ``{"dates": [...], "sources": [...], "entities": [...]}``,
+        intent detection's natural output, matched against unit ingest metadata
+        (``source_meta``: dates through the ONE ISO canonicalizer, sources/entities
+        case-insensitive substring vs source/title). FEEDER ONLY: matched units' best
+        evidence spans join the read's repair-candidate ledger — constraints NEVER
+        touch pool scoring or serving (the BM25-hybrid precedent: every lexical
+        pool-scoring term was net-negative and displaced news covenant golds).
         """
+        if subs is not None and not isinstance(subs, (list, tuple)):
+            raise TypeError(
+                "subs must be a list of sub-question strings or {'q','hyde'} dicts")
+        if constraints is not None and not isinstance(constraints, dict):
+            raise TypeError(
+                "constraints must be a dict like "
+                "{'dates': [...], 'sources': [...], 'entities': [...]}")
+        if (subs is not None or constraints is not None) and self._read_path != "pool":
+            # Fail LOUD (query_keys/decompose precedent): probes score only the pool
+            # scan and the candidate ledger feeds the pool-path repair loop — on the
+            # unit path both params would be structurally inert (the silent-failure
+            # class a measured forensic run paid for).
+            raise ValueError("subs=/constraints= require read_path='pool'")
         if self._read_path == "pool":
             # v0.6 — the pool-first read path (opt-in). The unit path below stays byte-identical.
-            return self._pool_read(query, namespace=namespace, related=related, strategy=strategy)
+            return self._pool_read(query, namespace=namespace, related=related,
+                                   strategy=strategy, subs=subs, constraints=constraints)
         strat = strategy or self._strategy
         ns = namespace or ""
         qe = tuple(self._embedder.embed(query))
@@ -888,6 +1151,12 @@ class SemanticCache:
 
         if self._residual_spans:
             self._log_read(read_id, qe, ns, (unit.id,), (), 0)
+        # v0.7 read surface: served sources + freshness age (observational — the serve is
+        # already fixed above; these fields never influence it).
+        served_sources: list[str] = []
+        for c in evidence:
+            if c.artifact_id and c.artifact_id not in served_sources:
+                served_sources.append(c.artifact_id)
         return Result(
             understanding=dict(unit.understanding),
             evidence=evidence,
@@ -903,6 +1172,8 @@ class SemanticCache:
             recalled=recalled,
             needs_retrieval=needs_retrieval,
             read_id=read_id,
+            sources=served_sources,
+            max_source_age_s=max(self._clock() - unit.freshness_epoch, 0.0),
         )
 
     def _match_score(self, qe: tuple[float, ...], unit: Cognition) -> float:
@@ -1251,6 +1522,10 @@ class SemanticCache:
             unit.query_embedding = qe
         unit.understanding = understanding
         unit.evidence = tuple(chunks)  # retain ALL raw — the floor, regardless of citations
+        # v0.7 ingest metadata: capture the dominant artifact's chunk meta alongside the
+        # evidence it came from — recomputed on every (re)build, so the header material
+        # can never outlive the sources it names.
+        unit.source_meta = self._dominant_meta(chunks)
         unit.provenance = ProvenanceManifest("synth@1", "semantic@2", source_spans=spans)
         # Key on what the unit KNOWS: (re)compute the understanding + per-claim embeddings.
         unit.understanding_embedding, unit.claim_embeddings = self._cognition_embeddings(
@@ -1293,6 +1568,24 @@ class SemanticCache:
         self._rows_epoch += 1     # the unit's claim rows changed — monotone, never cancels
         self._index_unit_rows(unit)   # pool mode: incremental per-unit row replacement
         return synthesis.usage
+
+    @staticmethod
+    def _dominant_meta(chunks: list[Chunk]) -> dict[str, str]:
+        """The unit's ``source_meta`` (v0.7): group the evidence per artifact, pick the
+        DOMINANT artifact (most chunks; ties break to first-seen — the same dominance
+        rule the split path keys unit identity on), then the FIRST of its chunks that
+        carries ``meta`` wins. Empty when no chunk of the dominant artifact has meta —
+        the default header then falls through to the query/id rungs, never fabricates."""
+        counts: dict[str, int] = {}
+        for c in chunks:
+            counts[c.artifact_id] = counts.get(c.artifact_id, 0) + 1
+        if not counts:
+            return {}
+        dom = max(counts, key=lambda k: counts[k])   # max keeps first-seen on ties
+        for c in chunks:
+            if c.artifact_id == dom and c.meta:
+                return {str(k): str(v) for k, v in c.meta.items()}
+        return {}
 
     def _account_usage(self, usage: Usage | None) -> None:
         """Roll a synthesis call's token cost into the cache totals (surfaced by ``stats()``)."""
@@ -1668,18 +1961,35 @@ class SemanticCache:
         namespace: str | None,
         related: int,
         strategy: str | None,
+        subs: "list[str | dict[str, Any]] | None" = None,
+        constraints: dict[str, Any] | None = None,
     ) -> Result:
         """The claim-pool-first read (spec §2.4, P0–P8): every read is answered by
         budget-packing the global fresh-claim pool; units remain the ownership /
         freshness / build / provenance skeleton. At most ONE query-shaped retrieval
         per read; gate/floor decisions read the PRE-rerank cosine only."""
-        # P0 — VALIDATE / EMBED
+        # P0 — VALIDATE / EMBED. MECHANISM 2's BYO callable runs FIRST so the raw query
+        # and every decomposition probe text share ONE batched embedder call (the
+        # PREREG-MECH2B ship-plan latency optimization — answer-neutral: vectors, and so
+        # every downstream score, are byte-identical to the per-text calls; pinned by
+        # test_batched_embed_scores_byte_identical_to_per_text). With the knob off (or
+        # no probes) this is the single embed(query) call, byte-identical v0.6.
         strat = strategy or self._strategy
         ns = namespace or ""
-        qe = tuple(self._embedder.embed(query))
+        probe_texts, n_hyde, sub_tails = self._decompose_texts(query, subs)
+        qe, probes, probe_texts = self._embed_read_vectors(query, probe_texts, n_hyde)
         self._read_seq += 1
         read_id = f"read-{self._read_seq}"   # deterministic (a monotonic counter string)
         self._reads_total += 1
+
+        # v0.7 CONSTRAINTS/METADATA MATCH (first-pass step 1, query-only, ~0ms, $0):
+        # FEEDER ONLY — matched units' best evidence spans join the repair-candidate
+        # ledger banked with this read; pool scoring and serving are untouched by
+        # construction (nothing below reads the ledger). Evidence: NEWS-02 SBF and
+        # NEWS-03 Google were metadata->repair chain wins after plain repair failed
+        # twice — cosine is blind to attribution, headers are not.
+        if constraints:
+            self._bank_constraint_candidates(read_id, ns, qe, constraints)
         read_usage: Usage | None = None
         synthesis_ran = False
         retrieval_ran = False
@@ -1748,7 +2058,12 @@ class SemanticCache:
             logger.warning(
                 "pure-python pool scan over %d rows — install coalent[fast] for numpy",
                 len(index))
-        cands = self._index_search(index, qe, _POOL_STAGE1_RAW)
+        # MECHANISM 2 (opt-in ``decompose=`` — PREREG-MECH2.md): the sub-question probe
+        # embeddings were computed ONCE at P0 (batched with the raw query); every pool
+        # scan of this read (initial, TTL re-scan, post-build re-scan) uses the same
+        # MAX-union scoring. [] when the knob is off — _pool_scan is then the single
+        # raw-query search, byte-identical v0.6.
+        cands = self._pool_scan(index, qe, probes)
         fresh_rows = [(s, ref) for s, ref, fresh in cands if fresh]
         stale_hits = [(s, ref) for s, ref, fresh in cands if not fresh and s >= gate]
         if stale_hits:  # telemetry only — include_stale MAY be unsupported (event won't fire)
@@ -1766,7 +2081,7 @@ class SemanticCache:
                 and fresh_rows):
             ttl_masked, flipped = self._pool_ttl(fresh_rows)
             if flipped:
-                cands = self._index_search(index, qe, _POOL_STAGE1_RAW)
+                cands = self._pool_scan(index, qe, probes)
                 fresh_rows = [(s, ref) for s, ref, fresh in cands if fresh]
             if ttl_masked:
                 fresh_rows = [(s, ref) for s, ref in fresh_rows
@@ -1800,7 +2115,7 @@ class SemanticCache:
                 if ran:
                     synthesis_ran = True
                     ttl_masked -= touched              # a rebuilt owner is verifiably fresh
-                    cands = self._index_search(index, qe, _POOL_STAGE1_RAW)
+                    cands = self._pool_scan(index, qe, probes)
                     fresh_rows = [(s, ref) for s, ref, fresh in cands
                                   if fresh and ref.unit_id not in ttl_masked]
         fresh_rows = self._apply_query_keys(ns, qe, fresh_rows, ttl_masked, key_fired)
@@ -1924,6 +2239,17 @@ class SemanticCache:
         evidence = (list(probe_chunks or reuse_evidence)
                     if (synthesis_ran or escalated) else [])
 
+        # v0.7 GAP DETECTOR (late-first-pass, $0 API): per-probe best-span vs best-claim
+        # margin over the lazily-hydrated evidence-sentence tier. OBSERVES, NEVER PACKS —
+        # runs after pack/render, touches none of their inputs (pinned: serving is
+        # byte-identical with the knob on). Fired spans bank as repair candidates.
+        det_probes: list[str] = []
+        probe_coverage: list[dict[str, Any]] = []
+        det_gaps: list[dict[str, Any]] = []
+        if self._gap_detector:
+            det_probes, probe_coverage, det_gaps = self._detect_gaps(
+                index, ns, query, qe, probe_texts, probes, read_id)
+
         if self._residual_spans:
             self._log_read(
                 read_id, qe, ns,
@@ -1931,6 +2257,20 @@ class SemanticCache:
                 tuple(t for _u, t in served_spans),
                 est_used,
             )
+        # v0.7 second-pass surface: remember what SERVED (owner+text refs) + the read's
+        # probe shape in the read-meta ring, so repair() can derive bridge candidates
+        # and reprobe() can harvest entities later. Refs only, no vectors; recorded
+        # AFTER pack/render — observational, never an input to serving.
+        self._record_read_meta(
+            read_id, query, ns, sub_tails, probe_texts,
+            [(h.unit_id, h.text) for h in picked])
+        # v0.7 read surface: served sources + freshness age. Served order first — each
+        # served owner (claims, then span owners) contributes its evidence artifacts, then
+        # any escalation raw; de-duplicated. Age = MAX served-owner age (the same quantity
+        # the stats() age-at-serve aggregate reads). Observational only: computed AFTER
+        # pack/render, never an input to them.
+        served_sources, owner_ages = self._serve_surface(
+            [h.unit_id for h in picked] + [u for u, _ in served_spans], raw_chunks)
         return Result(
             understanding={"claims": list(served_texts)},   # no summary key (documented)
             evidence=evidence,
@@ -1948,6 +2288,11 @@ class SemanticCache:
             pool=pool_claims,
             needs_retrieval=needs_retrieval,
             read_id=read_id,
+            sources=served_sources,
+            max_source_age_s=max(owner_ages, default=0.0),
+            probes=det_probes,
+            probe_coverage=probe_coverage,
+            gaps=det_gaps,
         )
 
     def _effective_pool_gate(self) -> float:
@@ -2077,6 +2422,147 @@ class SemanticCache:
             logger.warning("claim index search failed — treating the pool as empty",
                            exc_info=True)
             return []
+
+    def _decompose_texts(
+        self, query: str, subs: "list[str | dict[str, Any]] | None" = None
+    ) -> tuple[list[str], int, list[str]]:
+        """MECHANISM 2 (v0.7, ``decompose=`` — PREREG-MECH2.md): assemble the probe
+        TEXTS for the pool-scan union; returns ``(texts, n_hyde, tails)`` where
+        ``tails`` are the hyde-free sub-question strings aligned with the probes —
+        kept for the read-meta ring (reprobe's "<entity> — <sub-question-tail>"
+        probes must never inherit hyde text: the Madonna cascade). Embedding happens
+        in ``_embed_read_vectors``, batched with the raw query into the read's single
+        embedder call.
+
+        OWNERSHIP (v0.7 ``subs=`` — PIPELINE-DESIGN-v07 upstream params): a planner-
+        supplied ``subs`` list WINS over the BYO callable for that read (explicit wins —
+        the Madonna hyde-cascade is why a grounded planner should own probe CONTENT);
+        the callable stays as the fallback for naked deployments. ``subs=[]`` is the
+        sanctioned explicit "no decomposition" (the callable is NOT consulted). Both
+        routes feed the SAME normalization — clamp, skip, HyDE concat, dedup — so
+        identical content serves byte-identically (pinned).
+
+        Contract: ``fn(query) -> [{"q": str, "hyde": str | None}, ...]``; ``subs``
+        entries are the same dicts or bare sub-question strings. Entries beyond
+        ``_DECOMPOSE_MAX_SUBS`` are dropped; entries without a non-empty ``q`` are
+        skipped. When an entry carries a hypothetical answer (HyDE-lite), the probe text
+        is the ``"<q> <hyde>"`` concatenation — one embedding either way.
+
+        Fail-open contract (same as a broken BYO claim index): a raising callable, a
+        malformed return, or a malformed ``subs`` entry logs a warning and returns
+        ``([], 0, [])`` — the read proceeds on the raw query exactly as with the knob
+        off. An empty return is the sanctioned no-decomposition signal (no warning)."""
+        if subs is not None:
+            try:
+                entries: list[Any] = [{"q": e} if isinstance(e, str) else e for e in subs]
+                return self._probe_entries(entries)
+            except Exception:  # noqa: BLE001 — fail open: raw-query read, never crash
+                logger.warning("subs= malformed — reading on the raw query only",
+                               exc_info=True)
+                return [], 0, []
+        fn = self._decompose
+        if fn is None:
+            return [], 0, []
+        try:
+            return self._probe_entries(list(fn(query)))
+        except Exception:  # noqa: BLE001 — fail open: raw-query read, never crash
+            logger.warning("decompose callable failed — reading on the raw query only",
+                           exc_info=True)
+            return [], 0, []
+
+    @staticmethod
+    def _probe_entries(entries: list[Any]) -> tuple[list[str], int, list[str]]:
+        """The ONE probe-text normalization both decomposition routes share (callable
+        and planner ``subs=``): clamp to ``_DECOMPOSE_MAX_SUBS`` entries, skip empty
+        ``q``, HyDE-lite ``"<q> <hyde>"`` concat, order-preserving dedup. Returns
+        ``(probe_texts, n_hyde, tails)`` — ``tails`` = the deduped hyde-free ``q``
+        strings, the reprobe ring's sub-question tails."""
+        texts: list[str] = []
+        tails: list[str] = []
+        n_hyde = 0
+        for entry in entries[:_DECOMPOSE_MAX_SUBS]:
+            q = str(entry.get("q") or "").strip()
+            if not q:
+                continue
+            hyde_raw = entry.get("hyde")
+            hyde = str(hyde_raw).strip() if isinstance(hyde_raw, str) else ""
+            if hyde:
+                n_hyde += 1
+            texts.append(f"{q} {hyde}".strip() if hyde else q)
+            tails.append(q)
+        # duplicate probes are max-idempotent; tails dedup independently (two probes
+        # differing only in hyde share one tail)
+        return list(dict.fromkeys(texts)), n_hyde, list(dict.fromkeys(tails))
+
+    def _embed_read_vectors(
+        self, query: str, probe_texts: list[str], n_hyde: int
+    ) -> tuple[tuple[float, ...], list[tuple[float, ...]], list[str]]:
+        """EMBED-BATCHING (PREREG-MECH2B ship plan): embed the read's raw query and all
+        decomposition probe texts in ONE embedder call — ``embed_texts`` rides
+        ``embed_many`` when the embedder has one, the same lever the build path uses for
+        per-claim embeddings. Answer-neutral by construction: the vectors are exactly
+        what the per-text calls would have produced, so every downstream score is
+        byte-identical (pinned: test_batched_embed_scores_byte_identical_to_per_text);
+        latency is the only thing that changes.
+
+        With no probe texts (knob off, sanctioned empty decomposition, or a failed
+        callable) this is the plain single ``embed(query)`` call — byte-identical v0.6.
+        Fail-open: a failing batched call falls back to the raw-query-only read
+        (warning), matching the old probe-embed failure contract; a query that cannot be
+        embedded at all still raises, exactly as it always has. Zero-vector probes are
+        dropped; emits ``pool_decomposed`` when probes are produced. Returns
+        ``(qe, probe_vectors, kept_probe_texts)`` — texts stay ALIGNED with their
+        vectors (v0.7: the gap detector scores and echoes them per probe)."""
+        if not probe_texts:
+            return tuple(self._embedder.embed(query)), [], []
+        try:
+            vecs = embed_texts(self._embedder, [query, *probe_texts])
+            qe = tuple(vecs[0])
+            raw_probes = vecs[1:]
+        except Exception:  # noqa: BLE001 — fail open: raw-query read, never crash
+            logger.warning("decompose probe embedding failed — reading on the raw "
+                           "query only", exc_info=True)
+            return tuple(self._embedder.embed(query)), [], []
+        probes: list[tuple[float, ...]] = []
+        kept_texts: list[str] = []
+        for t, v in zip(probe_texts, raw_probes):
+            if v and any(v):
+                probes.append(tuple(float(x) for x in v))
+                kept_texts.append(t)
+        if probes:
+            self._emit("pool_decomposed", n_subs=len(probe_texts), n_probes=len(probes),
+                       n_hyde=n_hyde)
+        return qe, probes, kept_texts
+
+    def _pool_scan(
+        self,
+        index: ClaimIndex,
+        qe: tuple[float, ...],
+        probes: list[tuple[float, ...]],
+    ) -> list[tuple[float, ClaimRef, bool]]:
+        """The pool scan, decomposition-aware. With no probes (the default-OFF path and
+        every probe-degraded read) this IS ``_index_search(index, qe, _POOL_STAGE1_RAW)``
+        — byte-identical v0.6. With probes, each claim's score is the MAX cosine over
+        {raw query, all probes} and the scan returns the top ``_POOL_STAGE1_RAW`` rows
+        under the standard ``(-score, unit_id, claim_idx)`` tie-break.
+
+        The raw query is ALWAYS in the union (prereg: the sub-queries-only arm B
+        collapses the tail — pre-refuted). Merging the per-vector top-N lists by
+        per-row MAX is exact, not approximate: any row in the global top-N under
+        max-union scores is, via the probe that achieves its max, ranked above by only
+        rows that also outrank it globally — so it appears in that probe's own top-N."""
+        if not probes:
+            return self._index_search(index, qe, _POOL_STAGE1_RAW)
+        merged: dict[tuple[str, int], tuple[float, ClaimRef, bool]] = {}
+        for vec in (qe, *probes):
+            for s, ref, fresh in self._index_search(index, vec, _POOL_STAGE1_RAW):
+                key = (ref.unit_id, ref.claim_idx)
+                prev = merged.get(key)
+                if prev is None or s > prev[0]:
+                    merged[key] = (s, ref, fresh)
+        ranked = sorted(merged.values(),
+                        key=lambda row: (-row[0], row[1].unit_id, row[1].claim_idx))
+        return ranked[:_POOL_STAGE1_RAW]
 
     def _pool_ttl(
         self, fresh_rows: list[tuple[float, ClaimRef]]
@@ -2414,15 +2900,25 @@ class SemanticCache:
 
     @staticmethod
     def _default_header(unit: Cognition) -> str:
-        """The built-in attribution line (measured finding: an unattributed pool payload
+        """The built-in attribution ladder (measured finding: an unattributed pool payload
         makes per-source questions unanswerable BY CONSTRUCTION — claims cannot name their
-        own outlet). Default = the spec §7.1 fallback header, shipped after the fork's
-        paid confirm measured the opaque id form 0.089 BELOW the rig-parity header
-        (0.6413 vs 0.7306 strict, n=605 — far past the 0.03 fork criterion): the unit's
-        build QUERY carries source-identifying text (e.g. "key facts of the article:
-        {title}"), so serve its first 60 chars as a "## " heading. Only a unit with no
-        query text falls back to the opaque "[source: {artifact_id}]" line; an explicit
-        ``pool_header`` callable still overrides everything."""
+        own outlet). Each rung's grade is paid n=605 strict accuracy on the frozen store:
+
+          1. v0.7 ingest metadata (``unit.source_meta``, captured from ``Chunk.meta`` at
+             build) -> ``[{title} | {source} | {date}]``, missing keys skipped, ``" | "``-
+             joined — the 0.7306 metadata-callable form, now reachable WITHOUT a callable;
+          2. else the unit's build QUERY as a ``## `` heading, first 60 chars (0.6777 —
+             the query carries source-identifying text, e.g. "key facts of the article:
+             {title}");
+          3. else the opaque ``[source: {artifact_id}]`` line (0.6413 — the floor).
+
+        An explicit ``pool_header`` callable still overrides everything."""
+        if unit.source_meta:
+            parts = [str(unit.source_meta.get(k) or "").strip()
+                     for k in ("title", "source", "date")]
+            line = " | ".join(p for p in parts if p)
+            if line:
+                return f"[{line}]"
         q = (unit.query or "").strip()
         if q:
             return "## " + q[:60]
@@ -2431,7 +2927,8 @@ class SemanticCache:
 
     def _pool_header_text(self, unit_id: str) -> str:
         """The per-group attribution header. ``pool_header=None`` falls back to the built-in
-        default (``## {unit.query[:60]}``, else ``[source: ...]`` — spec §7.1 fork) — the
+        ladder (``[{title} | {source} | {date}]`` from ingest meta, else ``## {unit.query
+        [:60]}``, else ``[source: ...]`` — spec §7.1 fork + the v0.7 metadata rung) — the
         pool path is UNABLE to serve an unattributed group; a caller callback overrides it.
         A raising hook is swallowed, never breaks serving (headerless then, and its cost is
         never counted — the shipped contract)."""
@@ -2557,6 +3054,469 @@ class SemanticCache:
                     embedding=tuple(next(embs)))
                 for s in u.residual_spans
             )
+
+    # ------------------------------------ gap detector (v0.7, opt-in gap_detector)
+    @staticmethod
+    def _gap_content_key(unit: Cognition) -> str:
+        """The per-unit hydration key: a digest of the unit's evidence (artifact + text).
+        A rebuild that changes the evidence changes the key, so exactly the changed unit
+        re-splits and re-embeds — everything else stays warm in the side store."""
+        h = hashlib.sha256()
+        for c in unit.evidence:
+            h.update(c.artifact_id.encode("utf-8", "ignore"))
+            h.update(b"\x1f")
+            h.update(c.text.encode("utf-8", "ignore"))
+            h.update(b"\x1e")
+        return h.hexdigest()[:16]
+
+    @staticmethod
+    def _gap_evidence_sentences(unit: Cognition) -> list[ResidualSpan]:
+        """The FULL evidence-sentence tier of one unit (no embeddings yet): split each
+        evidence chunk on newlines then sentence punctuation (the bench's established
+        split), strip, keep >= _GAP_SENT_MIN_CHARS chars, de-duplicate within the unit
+        on whitespace/case-normalized text (evidence chunks overlap). Provenance
+        (artifact + chunk index) is captured here, never re-derived. SPEC DELTA note:
+        this tier — not the residual tier — is the detector's span source; the
+        residual-density sweep measured residual spans dead for this job (0/130 fires)
+        while the lab's fire evidence was measured on exactly this sentence store."""
+        out: list[ResidualSpan] = []
+        seen: set[str] = set()
+        for idx, chunk in enumerate(unit.evidence):
+            for part in _GAP_LINE_SPLIT.split(chunk.text):
+                for raw in _SENT_SPLIT.split(part):
+                    s = raw.strip()
+                    if len(s) < _GAP_SENT_MIN_CHARS:
+                        continue
+                    k = " ".join(s.lower().split())
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    out.append(ResidualSpan(
+                        text=s, artifact_id=chunk.artifact_id, chunk_idx=idx))
+        return out
+
+    def _gap_sentence_rows(
+        self, ns: str
+    ) -> tuple[list[tuple[str, ResidualSpan]], Any]:
+        """(owner_id, sentence-span) rows over FRESH units in ``ns`` plus a pre-normalized
+        numpy matrix (None on the pure path) — the detector's scoring substrate. LAZY at
+        every level (no warm-at-ingest, per covenant): a unit's sentences split + embed on
+        the namespace's first detector use, cached in the side store keyed
+        ``(unit id, evidence content hash)``; the namespace view is epoch-keyed exactly
+        like the pool index. All pending units embed in ONE batched call. Fail-open: an
+        embed failure degrades the detector to the already-hydrated units (warning),
+        never crashes the read. The side store is also the warm-cache seam — a driver
+        holding precomputed sentence embeddings may pre-seed it."""
+        marker = (ns, self._rows_epoch, self._status_gen)
+        state = self._gap_state
+        if state is not None and state[0] == marker:
+            return state[1], state[2]
+        fresh_units = [u for u in self._units.values()
+                       if u.namespace == ns and u.is_fresh and u.evidence]
+        self._hydrate_gap_units(fresh_units)
+        for uid in [k for k in self._gap_sent_cache if k not in self._units]:
+            del self._gap_sent_cache[uid]        # deleted units never resurrect
+        rows: list[tuple[str, ResidualSpan]] = []
+        dim = 0
+        for u in fresh_units:
+            cached = self._gap_sent_cache.get(u.id)
+            if cached is None:
+                continue
+            for span in cached[1]:
+                if not span.embedding or not any(span.embedding):
+                    continue
+                if dim == 0:
+                    dim = len(span.embedding)
+                if len(span.embedding) == dim:    # embedder-swap leftovers can't poison
+                    rows.append((u.id, span))
+        matrix: Any = None
+        if _np is not None and rows:
+            m: Any = _np.asarray([s.embedding for _, s in rows], dtype=_np.float64)
+            n = _np.linalg.norm(m, axis=1, keepdims=True)
+            matrix = m / _np.where(n > 0, n, 1.0)
+        self._gap_state = (marker, rows, matrix)
+        return rows, matrix
+
+    def _hydrate_gap_units(self, units: list[Cognition]) -> None:
+        """Split + embed the evidence-sentence tier for exactly ``units``, in ONE batched
+        embed call, into the side store keyed ``(unit id, evidence content hash)`` —
+        already-current units are skipped, so hydration stays lazy and incremental.
+        Fail-open: an embed failure leaves the pending units unhydrated (warning), never
+        crashes the read."""
+        pending: list[tuple[Cognition, str, list[ResidualSpan]]] = []
+        for u in units:
+            key = self._gap_content_key(u)
+            cached = self._gap_sent_cache.get(u.id)
+            if cached is not None and cached[0] == key:
+                continue
+            pending.append((u, key, self._gap_evidence_sentences(u)))
+        if not pending:
+            return
+        texts = [s.text for _u, _k, sents in pending for s in sents]
+        try:
+            embs = iter(embed_texts(self._embedder, texts) if texts else [])
+            for u, key, sents in pending:
+                self._gap_sent_cache[u.id] = (key, tuple(
+                    ResidualSpan(text=s.text, artifact_id=s.artifact_id,
+                                 chunk_idx=s.chunk_idx,
+                                 embedding=tuple(next(embs)))
+                    for s in sents))
+        except Exception:  # noqa: BLE001 — a signal/feeder must never take down the read
+            logger.warning("evidence-sentence embedding failed — gap tier degraded to "
+                           "already-hydrated units", exc_info=True)
+
+    @staticmethod
+    def _constraint_match(unit: Cognition, dates: list[str], sources: list[str],
+                          entities: list[str]) -> bool:
+        """One unit vs a ``constraints=`` dict — matched against the unit's INGEST
+        METADATA (``source_meta``: the title | source | date vocabulary the corpus
+        actually carries, per the NEWS-05 direction: match corpus metadata vocabulary,
+        never format regexes). Dates: both sides through the ONE canonicalizer, exact-day
+        equality. Sources/entities: case-insensitive substring vs the source/title
+        fields. ANY value matching banks the unit (OR semantics) — the single-key /
+        fallback matcher; ``_constraint_match_and`` is the >=2-keys conjunction.
+        No metadata = no match — the feeder never fabricates."""
+        meta = unit.source_meta
+        if not meta:
+            return False
+        if dates:
+            md = _canonical_date(str(meta.get("date") or ""))
+            if md and any(_canonical_date(str(d)) == md for d in dates):
+                return True
+        title = str(meta.get("title") or "").lower()
+        source = str(meta.get("source") or "").lower()
+        for needle in (*sources, *entities):
+            n = str(needle).strip().lower()
+            if n and (n in source or n in title):
+                return True
+        return False
+
+    @staticmethod
+    def _constraint_match_and(unit: Cognition, dates: list[str], sources: list[str],
+                              entities: list[str]) -> bool:
+        """The >=2-keys conjunction (ROUND-COMPOSITION-VERDICT #2 / LAB-and-constraints
+        policy c — measured: −85% noise units at 221/222 gold retention with the
+        never-empty guard; reproduces + eliminates the NEWS-02 caption-unit feed): AND
+        across the provided keys, OR within a key's values. Each key's per-value test
+        is IDENTICAL to the OR matcher's (dates through the ONE canonicalizer;
+        sources/entities case-insensitive substring vs source/title) — only the
+        combination changes. Callers pass only DERIVABLE values: an underivable date
+        key (range phrases like 'between X and Y') is skipped upstream, never guessed
+        into a conjunct."""
+        meta = unit.source_meta
+        if not meta:
+            return False
+        if dates:
+            md = _canonical_date(str(meta.get("date") or ""))
+            if not (md and any(_canonical_date(str(d)) == md for d in dates)):
+                return False
+        title = str(meta.get("title") or "").lower()
+        source = str(meta.get("source") or "").lower()
+        for needles in (sources, entities):
+            if not needles:
+                continue
+            if not any((n := str(x).strip().lower()) and (n in source or n in title)
+                       for x in needles):
+                return False
+        return True
+
+    def _bank_constraint_candidates(
+        self, read_id: str, ns: str, qe: tuple[float, ...],
+        constraints: dict[str, Any],
+    ) -> None:
+        """The generalized metadata-fetch input (constraints= — THE STACK item 2),
+        FEEDER ONLY by deliberate limit: matched units' best evidence spans (top
+        ``_SPANS_PER_READ`` per unit by query cosine) join the read's repair-candidate
+        ledger. Never touches pool scoring or serving — the BM25 pool-scoring precedent
+        (net-negative at every lambda + covenant golds displaced) is why the restraint
+        is structural, not a knob. Hydration is per-MATCHED-unit lazy (the whole
+        namespace never embeds for a two-unit match). Unknown keys warn (a typo'd key
+        must never be a silent no-op); no match = clean no-op."""
+        unknown = set(constraints) - {"dates", "sources", "entities"}
+        if unknown:
+            logger.warning("constraints= unknown keys ignored: %s", sorted(unknown))
+        dates = [str(x) for x in (constraints.get("dates") or [])]
+        sources = [str(x) for x in (constraints.get("sources") or [])]
+        entities = [str(x) for x in (constraints.get("entities") or [])]
+        if not (dates or sources or entities):
+            return
+        pool = [u for u in self._units.values()
+                if u.namespace == ns and u.is_fresh and u.evidence]
+        # v0.7b POLICY (ROUND-COMPOSITION-VERDICT #2 / LAB-and-constraints policy c):
+        # EFFECTIVE keys = keys with >= 1 DERIVABLE value — a date that the ONE
+        # canonicalizer cannot parse (range phrases: "between X and Y", "after Nov 5")
+        # SKIPS the dates key entirely, never guesses a conjunct. >= 2 effective keys
+        # -> AND across keys / OR within a key's values; single key -> today's OR,
+        # byte-identical.
+        eff_dates = [d for d in dates if _canonical_date(d)]
+        eff_sources = [s for s in sources if s.strip()]
+        eff_entities = [e for e in entities if e.strip()]
+        n_keys = sum(1 for vals in (eff_dates, eff_sources, eff_entities) if vals)
+        if n_keys >= 2:
+            matched = [u for u in pool if self._constraint_match_and(
+                u, eff_dates, eff_sources, eff_entities)]
+            if not matched:
+                # NEVER-EMPTY guard (q272: an exact-day parse of "after November 5"
+                # emptied the AND set while OR held the gold Verge unit): fall back
+                # to the OR semantics rather than starving the feeder. Logged loud.
+                matched = [u for u in pool
+                           if self._constraint_match(u, dates, sources, entities)]
+                self._emit("constraints_and_fallback", keys=n_keys,
+                           or_matched=len(matched))
+        else:
+            matched = [u for u in pool
+                       if self._constraint_match(u, dates, sources, entities)]
+        if not matched:
+            return
+        self._hydrate_gap_units(matched)
+        entries: list[dict[str, Any]] = []
+        for u in sorted(matched, key=lambda x: x.id):
+            cached = self._gap_sent_cache.get(u.id)
+            if cached is None:
+                continue
+            spans = [s for s in cached[1] if s.embedding and any(s.embedding)]
+            if not spans:
+                continue
+            sims = [cosine(qe, s.embedding) for s in spans]
+            order = sorted(range(len(spans)),
+                           key=lambda i: (-sims[i], spans[i].chunk_idx, i))
+            for i in order[:_SPANS_PER_READ]:
+                entries.append({"probe": "", "span": spans[i].text, "unit_id": u.id,
+                                "source": spans[i].artifact_id, "kind": "metadata",
+                                "score": sims[i], "origin": "constraints"})
+        if entries:
+            self._bank_candidates(read_id, entries)
+            self._emit("constraints_matched",
+                       units=sorted({e["unit_id"] for e in entries}),
+                       banked=len(entries))
+
+    def _detect_gaps(
+        self,
+        index: ClaimIndex,
+        ns: str,
+        query: str,
+        qe: tuple[float, ...],
+        probe_texts: list[str],
+        probes: list[tuple[float, ...]],
+        read_id: str,
+    ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Lab arm C as a SIGNAL (never a server): for each probe of this read (raw query
+        first — it is always in the union), the best fresh CLAIM-pool cosine vs the best
+        EVIDENCE-SENTENCE cosine, margin = span - claim. Fire (margin > _GAP_DELTA) = a
+        measured extraction hole: the source HAS the fact, the claim tier doesn't —
+        repair terrain, banked as a candidate on the read ledger. Both tiers under
+        ``span_serve_floor`` = corpus hole: neither tier reaches the probe — tool-routing
+        terrain, nothing to bank. $0 API: reuses the read's own probe embeddings against
+        the hydrated sentence matrix (one matvec per probe). Returns
+        (probes, probe_coverage, gaps)."""
+        rows, matrix = self._gap_sentence_rows(ns)
+        texts_all = [query, *probe_texts]
+        vecs_all = [qe, *probes]
+        coverage: list[dict[str, Any]] = []
+        gaps: list[dict[str, Any]] = []
+        banked: list[dict[str, Any]] = []
+        weak = self._span_serve_floor       # the library's established span-quality bar
+        for text, vec in zip(texts_all, vecs_all):
+            best_claim = next(
+                (s for s, _ref, fresh in self._index_search(index, vec, _POOL_STAGE1_RAW)
+                 if fresh), 0.0)
+            best_span = 0.0
+            best_row: tuple[str, ResidualSpan] | None = None
+            if rows:
+                sims = self._score_spans(rows, matrix, vec)
+                j = min(range(len(rows)),
+                        key=lambda i: (-sims[i], rows[i][0], rows[i][1].chunk_idx))
+                best_span = sims[j]
+                best_row = rows[j]
+            margin = best_span - best_claim
+            fired = margin > _GAP_DELTA
+            coverage.append({"probe": text, "best_claim": best_claim,
+                             "best_span": best_span, "margin": margin, "fired": fired})
+            if best_claim < weak and best_span < weak:
+                gaps.append({"probe": text,
+                             "span": best_row[1].text if best_row else "",
+                             "unit_id": best_row[0] if best_row else "",
+                             "source": best_row[1].artifact_id if best_row else "",
+                             "kind": "corpus_hole"})
+            elif fired and best_row is not None:
+                uid, span = best_row
+                gap = {"probe": text, "span": span.text, "unit_id": uid,
+                       "source": span.artifact_id, "kind": "extraction_hole"}
+                gaps.append(gap)
+                banked.append(dict(gap, score=best_span, origin="detector"))
+        if banked:
+            self._bank_candidates(read_id, banked)
+        self._emit(
+            "gap_detector",
+            probes=len(texts_all),
+            fired=sum(1 for c in coverage if c["fired"]),
+            extraction_holes=sum(1 for g in gaps if g["kind"] == "extraction_hole"),
+            corpus_holes=sum(1 for g in gaps if g["kind"] == "corpus_hole"),
+            banked=len(banked),
+        )
+        return texts_all, coverage, gaps
+
+    def _bank_candidates(self, read_id: str, entries: list[dict[str, Any]]) -> None:
+        """Append repair candidates to the read's in-memory ledger (detector fires +
+        constraints matches; the repair increment consumes it). Its own ring cap — an
+        app that never calls repair() can never leak memory."""
+        self._read_bank.setdefault(read_id, []).extend(entries)
+        while len(self._read_bank) > _READ_LOG_CAP:
+            self._read_bank.pop(next(iter(self._read_bank)))
+
+    def _record_read_meta(
+        self,
+        read_id: str,
+        query: str,
+        ns: str,
+        tails: list[str],
+        probe_texts: list[str],
+        served: list[tuple[str, str]],
+    ) -> None:
+        """Remember a pool read's second-pass surface in the meta ring (last
+        ``_READ_LOG_CAP`` reads): the query, namespace, sub-question tails (hyde-free),
+        the probe texts actually scored, and the served (owner, claim-text) refs in
+        served order. Text refs only — vectors are re-derivable (owner rows) or
+        re-embeddable (probes), so the always-on ring stays light."""
+        self._read_meta[read_id] = {
+            "query": query, "ns": ns, "tails": list(tails),
+            "probe_texts": list(probe_texts), "served": list(served),
+        }
+        while len(self._read_meta) > _READ_LOG_CAP:
+            self._read_meta.pop(next(iter(self._read_meta)))
+
+    def _serve_surface(
+        self, owner_uids: list[str], raw_chunks: list[Chunk]
+    ) -> tuple[list[str], list[float]]:
+        """(served sources, served-owner ages): each owner uid — served order first,
+        de-duplicated — contributes its evidence artifacts, then any escalation raw
+        chunks append. The v0.7 read-surface computation, shared by the pool read and
+        reprobe(); observational only (computed after pack/render)."""
+        served_sources: list[str] = []
+        owner_ages: list[float] = []
+        seen_owners: set[str] = set()
+        now_s = self._clock()
+        for uid in owner_uids:
+            if uid in seen_owners:
+                continue
+            seen_owners.add(uid)
+            owner = self._units.get(uid)
+            if owner is None:
+                continue
+            owner_ages.append(max(now_s - owner.freshness_epoch, 0.0))
+            for c in owner.evidence:
+                if c.artifact_id and c.artifact_id not in served_sources:
+                    served_sources.append(c.artifact_id)
+        for c in raw_chunks:
+            if c.artifact_id and c.artifact_id not in served_sources:
+                served_sources.append(c.artifact_id)
+        return served_sources, owner_ages
+
+    @staticmethod
+    def _norm_text(s: str) -> str:
+        """The exact-norm key (case + whitespace collapse) — the ONE normalization the
+        repair dedup and candidate de-duplication share with the sentence-tier dedup."""
+        return " ".join(s.lower().split())
+
+    @staticmethod
+    def _claim_defect(text: str) -> str | None:
+        """Mechanical repair-admission hygiene — the two banked span-extraction defect
+        shapes (LAB-displacement §5), rejected before dedup, counted in
+        ``RepairReport.rejected``:
+
+        * ``"pronoun_subject"`` — leading he/she/it/they/this/that subject with NO
+          proper noun anywhere in the claim (antecedent-free: "He was the richest
+          person in the world under 30" — the referent was lost at extraction, q346).
+          A pronoun subject WITH a proper noun later in the claim is kept (the
+          referent is at least present).
+        * ``"truncated"`` — a leading ellipsis or lowercase first character
+          (mid-sentence cut), a trailing comma/colon/semicolon/dash/ellipsis, or a
+          dangling connector tail ("...updates and highlights from Jaguars vs.",
+          q089).
+
+        Returns the defect name, or ``None`` for a well-formed claim. Purely
+        mechanical: no models, no lists beyond the pinned connector set."""
+        s = text.strip()
+        if not s:
+            return "truncated"
+        if s.startswith("...") or s.startswith("…"):
+            return "truncated"
+        if s[0].islower():
+            return "truncated"
+        if s.endswith(_TRUNC_TAIL_PUNCT):
+            return "truncated"
+        words = s.split()
+        last = words[-1].rstrip(".").strip("\"')").lower()
+        if last in _TRUNC_TAILS:
+            return "truncated"
+        lead = _LEAD_WORD.search(words[0])
+        if lead and lead.group(0).lower() in _PRONOUN_SUBJECTS:
+            if not _PROPER_NOUN.search(s[len(words[0]):]):
+                return "pronoun_subject"
+        return None
+
+    def _bridge_candidates(self, meta: dict[str, Any]) -> list[dict[str, Any]]:
+        """Recall-bridge candidates derived AT REPAIR TIME (arm D as a FEEDER, never a
+        server — falsified as a server at 82k scale: rank 126, seed-echo blockers;
+        decisive as a feeder on cricket, 42->6). Seeds = the read's top
+        ``_REPAIR_BRIDGE_SEEDS`` served claims' vectors — already pool rows, resolved
+        from their owners by text identity, ZERO new embeds — MAX-union scored over the
+        namespace's lazily hydrated evidence-sentence tier (the increment-2 side store,
+        warm-cache seam included); the top ``_REPAIR_BRIDGE_K`` spans join the repair
+        queue. Off the read path entirely: this runs only inside repair()."""
+        served = [(str(u), str(t)) for u, t in (meta.get("served") or [])]
+        seeds: list[tuple[float, ...]] = []
+        for uid, text in served[:_REPAIR_BRIDGE_SEEDS]:
+            unit = self._units.get(uid)
+            if unit is None:
+                continue
+            texts, embs = self._atomic_rows(unit)
+            for t, e in zip(texts, embs):
+                if t == text and any(e):
+                    seeds.append(e)
+                    break
+        if not seeds:
+            return []
+        rows, matrix = self._gap_sentence_rows(str(meta.get("ns") or ""))
+        if not rows:
+            return []
+        best = [-2.0] * len(rows)
+        for seed in seeds:
+            sims = self._score_spans(rows, matrix, seed)
+            for i, s in enumerate(sims):
+                if s > best[i]:
+                    best[i] = s
+        order = sorted(range(len(rows)),
+                       key=lambda i: (-best[i], rows[i][0], rows[i][1].chunk_idx))
+        out: list[dict[str, Any]] = []
+        for i in order[:_REPAIR_BRIDGE_K]:
+            uid, span = rows[i]
+            out.append({"probe": "", "span": span.text, "unit_id": uid,
+                        "source": span.artifact_id, "kind": "bridge",
+                        "score": best[i], "origin": "bridge"})
+        return out
+
+    @staticmethod
+    def _repair_region(unit: Cognition, span_text: str) -> str:
+        """The bounded ±1-sentence context region around ``span_text`` inside its
+        evidence chunk — the measured design's extraction input: region-only
+        re-extraction REPRODUCED the extractor's blindness (0 legspin claims), so the
+        span anchors the call and the region stays SMALL (neighbors only, never the
+        whole chunk). Sentence split = the tier's conventions (newlines, then sentence
+        punctuation). A span no longer locatable in the evidence (rebuilt since
+        banking) falls back to the span text itself."""
+        want = SemanticCache._norm_text(span_text)
+        for chunk in unit.evidence:
+            sents: list[str] = []
+            for part in _GAP_LINE_SPLIT.split(chunk.text):
+                for raw in _SENT_SPLIT.split(part):
+                    s = raw.strip()
+                    if s:
+                        sents.append(s)
+            for i, s in enumerate(sents):
+                if SemanticCache._norm_text(s) == want:
+                    return " ".join(sents[max(0, i - 1):i + 2])
+        return span_text
 
     # --------------------------------------- query keys (v0.6, opt-in query_keys)
     def _attach_key(
@@ -3144,6 +4104,554 @@ class SemanticCache:
             if confirmed:
                 self._emit("key_confirmed", unit_id=uid)
                 self._persist(unit)
+
+    # --------------------------------------------- second-pass surface (v0.7)
+    def repair(self, read_id: str) -> RepairReport:
+        """THE PUMP (PIPELINE-DESIGN-v07 §THE STACK item 7 — the only mechanism with
+        grounded end-to-end wins): convert a read's candidate SPANS into permanent
+        pool CLAIMS, so the fact the extractor missed serves at the NEXT first pass
+        through the UNCHANGED ranker (measured rank 1 GameStop, 2 Rams, 9 cricket).
+
+        Candidates = the read's banked ledger (detector fires + constraints matches,
+        consumed here) plus bridge candidates derived now (seeds = the read's top
+        served claims over the evidence-sentence tier). Per candidate span the BYO
+        ``repair_extractor(span_text, context_region, existing_claims)`` is called
+        SPAN-ANCHORED — the span text, a bounded ±1-sentence region, and the owning
+        unit's current claims as the do-not-repeat list (region-only re-extraction
+        reproduced the extractor's blindness; the anchor is REQUIRED). Survivors of
+        the mechanical dedup (exact-norm OR cosine >= 0.95 vs the unit's claims)
+        append to the owning unit — claims + inline embeddings + a per-claim
+        provenance record under ``understanding["_repair_provenance"]`` — append-only,
+        capped at ``_REPAIR_CAP`` new claims per call, persisted through the normal
+        store path. Emits ``repair_applied {unit_id, claims_added}`` per touched unit.
+
+        ALWAYS off the read path (lazy-build covenant): this method never fires on
+        its own — a later read's budget pays, never the failing read's. An unknown or
+        aged-out ``read_id``, or a read with nothing banked and nothing served, is a
+        clean no-op report. Raises only for the arming error (no BYO extractor)."""
+        if self._repair_extractor is None:
+            raise RuntimeError(
+                "repair() requires repair_extractor= at construction — a BYO "
+                "span-anchored extraction callable(span_text, context_region, "
+                "existing_claims) -> [claim, ...] (the library never calls an LLM "
+                "itself)")
+        banked = self._read_bank.pop(read_id, [])
+        meta = self._read_meta.get(read_id)
+        # THE QUEUE ORDER (replay-gate measured, two rules):
+        # 1. WITHIN the banked ledger, best score first — detector and constraints
+        #    scores are the same metric (probe/query -> span cosine), and consuming
+        #    in bank-insertion (unit-id) order let one date-matched caption unit
+        #    starve the admission cap on NEWS-02 while the right unit's spans were
+        #    never extracted ("the matched units' BEST spans join the queue";
+        #    lexical-I survives only as a candidate-set ORDERER inside this queue).
+        # 2. Bridge candidates APPEND AFTER the banked ledger (the build contract:
+        #    banked candidates "+ add bridge candidates at repair time") — their
+        #    seed-claim -> span cosines are a DIFFERENT, systematically higher
+        #    metric (same-topic claim/span pairs), and a global cross-metric sort
+        #    let the bridge monopolize the cap over the measured metadata chain on
+        #    NEWS-02/-03. Scores are never compared across the two metrics.
+        banked.sort(key=lambda e: -float(e.get("score") or 0.0))   # stable on ties
+        candidates: list[dict[str, Any]] = []
+        seen_spans: set[tuple[str, str]] = set()
+        for entry in [*banked, *(self._bridge_candidates(meta) if meta else [])]:
+            key = (str(entry.get("unit_id") or ""),
+                   self._norm_text(str(entry.get("span") or "")))
+            if not key[1] or key in seen_spans:
+                continue
+            seen_spans.add(key)
+            candidates.append(entry)
+        report = RepairReport(read_id=read_id, candidates_seen=len(candidates))
+        if not candidates:
+            return report
+        # Per-unit admission bar: (claim texts, claim vectors, exact-norm keys) —
+        # seeded from the unit's current rows, grown by this call's own admissions so
+        # a claim admitted from candidate 1 bars candidate 2's repeats. None = the
+        # unit is unusable (missing, stale, or rows/embeddings misaligned).
+        bars: dict[str, "tuple[list[str], list[tuple[float, ...]], set[str]] | None"] = {}
+        staged: dict[str, tuple[list[str], list[tuple[float, ...]],
+                                list[dict[str, Any]]]] = {}
+        for entry in candidates:
+            if report.admitted >= _REPAIR_CAP:
+                break   # permanence guard: stop extracting too, not just admitting
+            uid = str(entry.get("unit_id") or "")
+            if uid not in bars:
+                bars[uid] = self._repair_bar(uid)
+            bar = bars[uid]
+            if bar is None:
+                continue
+            unit = self._units[uid]
+            span_text = str(entry.get("span") or "")
+            region = self._repair_region(unit, span_text)
+            try:
+                raw = self._repair_extractor(span_text, region, list(bar[0]))
+            except Exception:  # noqa: BLE001 — one flaky BYO call never voids the rest
+                logger.warning("repair_extractor failed on a candidate span — skipped",
+                               exc_info=True)
+                continue
+            cand_texts = ([str(c).strip() for c in raw if str(c).strip()]
+                          if isinstance(raw, list) else [])
+            report.extracted += len(cand_texts)
+            if not cand_texts:
+                continue
+            # v0.7b ADMISSION HYGIENE (LAB-displacement defect ledger): reject the two
+            # banked defect shapes mechanically BEFORE embedding/dedup — antecedent-free
+            # pronoun subjects and truncated claims both served at pack-head ranks in
+            # the displacement dissection. Counted, never silently dropped.
+            kept_texts: list[str] = []
+            for t in cand_texts:
+                if self._claim_defect(t) is not None:
+                    report.rejected += 1
+                else:
+                    kept_texts.append(t)
+            cand_texts = kept_texts
+            if not cand_texts:
+                continue
+            try:
+                cand_embs = [tuple(float(x) for x in v)
+                             for v in embed_texts(self._embedder, cand_texts)]
+            except Exception:  # noqa: BLE001 — can't dedup unembeddable candidates
+                logger.warning("repair candidate embedding failed — span skipped",
+                               exc_info=True)
+                continue
+            for text, emb in zip(cand_texts, cand_embs):
+                if report.admitted >= _REPAIR_CAP:
+                    break
+                if not emb or not any(emb):
+                    continue
+                if self._norm_text(text) in bar[2]:
+                    continue   # exact-norm repeat
+                if max((cosine(emb, be) for be in bar[1]), default=0.0) >= _SPAN_DEDUP_SIM:
+                    continue   # near-dup rephrasing of an existing claim
+                prov = {"claim": text, "unit_id": uid, "span": span_text,
+                        "source": str(entry.get("source") or ""),
+                        "origin": str(entry.get("origin") or ""),
+                        "via": _REPAIR_VIA, "ts": self._clock()}
+                st = staged.setdefault(uid, ([], [], []))
+                st[0].append(text)
+                st[1].append(emb)
+                st[2].append(prov)
+                bar[0].append(text)
+                bar[1].append(emb)
+                bar[2].add(self._norm_text(text))
+                report.admitted += 1
+                report.claims.append(dict(prov))
+        for uid, (new_texts, new_embs, provs) in staged.items():
+            self._commit_repair(uid, new_texts, new_embs, provs)
+            report.units_touched.append(uid)
+        if report.admitted:
+            # v0.7b: remember what this read's repair admitted (ring, refs only) so a
+            # later serve_unserved() on the same question can force-pack the
+            # admitted-but-unserved claims (the q053/q327 packing-race class).
+            rec = self._read_repairs.setdefault(read_id, {
+                "query": str((meta or {}).get("query") or ""),
+                "ns": str((meta or {}).get("ns") or ""),
+                "claims": [],
+            })
+            rec["claims"].extend(dict(p) for p in report.claims)
+            while len(self._read_repairs) > _READ_LOG_CAP:
+                self._read_repairs.pop(next(iter(self._read_repairs)))
+        return report
+
+    def _repair_bar(
+        self, uid: str
+    ) -> "tuple[list[str], list[tuple[float, ...]], set[str]] | None":
+        """The admission bar for one unit: (claim texts, claim vectors, exact-norm
+        keys) from its current atomic rows. None disqualifies the unit: missing,
+        stale (its evidence is suspect — repaired claims must never enter a unit a
+        rebuild would replace), or rows/embeddings misaligned (an unbackfilled unit:
+        appending would pair new texts with the wrong vectors)."""
+        unit = self._units.get(uid)
+        if unit is None or not unit.is_fresh:
+            return None
+        claims = unit.understanding.get("claims")
+        n_claims = len(claims) if isinstance(claims, list) else 0
+        if len(unit.claim_embeddings or ()) < n_claims:
+            logger.warning("repair skipped unit %s — claim embeddings not aligned "
+                           "with claims (needs backfill)", uid)
+            return None
+        texts, embs = self._atomic_rows(unit)
+        kept = [(t, e) for t, e in zip(texts, embs) if t]
+        return ([t for t, _e in kept],
+                [e for _t, e in kept if any(e)],
+                {self._norm_text(t) for t, _e in kept})
+
+    def _commit_repair(
+        self,
+        uid: str,
+        new_texts: list[str],
+        new_embs: list[tuple[float, ...]],
+        provs: list[dict[str, Any]],
+    ) -> None:
+        """Append one unit's admitted repair claims: claim texts + INLINE embeddings
+        (inserted at the claims boundary, so rows stay claims-aligned even when the
+        embedding tuple carries trailing non-claim rows, e.g. a summary embedding) +
+        the per-claim provenance records — append-only, persisted via the normal
+        store path, pool rows re-indexed incrementally."""
+        unit = self._units[uid]
+        understanding = dict(unit.understanding)
+        claims = list(understanding.get("claims") or [])
+        n_before = len(claims)
+        claims.extend(new_texts)
+        understanding["claims"] = claims
+        prov_list = list(understanding.get("_repair_provenance") or [])
+        prov_list.extend({k: v for k, v in p.items() if k != "unit_id"} for p in provs)
+        understanding["_repair_provenance"] = prov_list
+        unit.understanding = understanding
+        ces = list(unit.claim_embeddings or ())
+        unit.claim_embeddings = (tuple(ces[:n_before]) + tuple(new_embs)
+                                 + tuple(ces[n_before:]))
+        self._persist(unit)
+        self._rows_epoch += 1   # the unit's rows changed — monotone, never cancels
+        self._index_unit_rows(unit)
+        self._emit("repair_applied", unit_id=uid, claims_added=len(new_texts))
+
+    @staticmethod
+    def _harvest_entities(served: list[tuple[str, str]], query: str) -> list[str]:
+        """The arm-J mechanical proper-noun harvest, conventions verbatim: entities =
+        regex runs of >=2 capitalized tokens in the SERVED claims, min length
+        ``_REPROBE_ENT_MIN``, QUESTION-TOKEN FILTERED (an entity already named by the
+        query adds nothing — ITER's power is the out-of-question hop entity);
+        UNIT-DIVERSE FIRST (round 1 takes at most one entity per served owner group,
+        round 2 fills in order), case-insensitive dedup, capped at
+        ``_REPROBE_ENTITY_CAP``."""
+        q_low = query.lower()
+        group_order: list[str] = []
+        groups: dict[str, list[str]] = {}
+        for uid, text in served:
+            if uid not in groups:
+                groups[uid] = []
+                group_order.append(uid)
+            groups[uid].append(text)
+
+        def _ents_of(text: str) -> list[str]:
+            out: list[str] = []
+            for m in _REPROBE_ENT.finditer(text):
+                e = m.group(0).strip()
+                if len(e) >= _REPROBE_ENT_MIN and e.lower() not in q_low:
+                    out.append(e)
+            return out
+
+        ents: list[str] = []
+        for uid in group_order:                       # round 1: one per unit group
+            for e in _ents_of(" ".join(groups[uid])):
+                if all(e.lower() != x.lower() for x in ents):
+                    ents.append(e)
+                    break
+        for uid in group_order:                       # round 2: fill remaining
+            for e in _ents_of(" ".join(groups[uid])):
+                if all(e.lower() != x.lower() for x in ents):
+                    ents.append(e)
+        return ents[:_REPROBE_ENTITY_CAP]
+
+    def reprobe(self, read_id: str, hint: str | None = None) -> Result | None:
+        """ITER AS AN EXPLICIT METHOD (PIPELINE-DESIGN-v07 §THE STACK item 8 / arm J
+        — rank 5 of 81,923 where every single-shot mechanism ranked 126-190): a
+        mechanical second retrieval pass over the SAME pool, embeds only, no LLM.
+
+        Harvests out-of-question proper-noun entities from the read's SERVED claims
+        (arm-J conventions: unit-diverse first, question-token filtered), builds up to
+        ``_REPROBE_PROBE_CAP`` probes ``"<entity> — <sub-question-tail>"`` (tails =
+        the read's hyde-free sub-questions — else the raw query — each passed through
+        the mechanical POISON GUARD: non-initial capitalized tokens stripped, so a
+        decomposer-hallucinated entity riding a tail cannot re-poison the probes;
+        ``hint`` — e.g. the answerer's draft — joins as ONE extra probe,
+        approximating the measured rank-1 answer-guided variant), embeds everything
+        in ONE batched call, and
+        re-ranks the pool under the MAX-union of {raw query, the read's original
+        probes, the new probes} — the union always includes the originals, so nothing
+        served can score worse. Repack through the unchanged serving stack; returns a
+        FRESH :class:`Result` with a new ``read_id`` and ``parent_read_id`` set.
+
+        NEVER auto-fires — an explicit app call (the second-pass ladder's rung c),
+        entirely off the default read path (byte-inert when never called — pinned).
+        Mechanical by design: no retrieval, no build, no TTL revalidation, no key
+        overlay, no gap detection, no escalation. Returns ``None`` (self-skip) on an
+        unknown/aged-out ``read_id``, when the served claims carry no harvestable
+        entities (4/87 measured — correctly idle on single-hop verdict classes), or
+        when the probe embed fails. Raises only the read-path arming error."""
+        if self._read_path != "pool":
+            # Fail LOUD (subs=/constraints= precedent): there is no pool to re-rank.
+            raise ValueError("reprobe requires read_path='pool'")
+        meta = self._read_meta.get(read_id)
+        if meta is None:
+            return None
+        query = str(meta.get("query") or "")
+        ns = str(meta.get("ns") or "")
+        served = [(str(u), str(t)) for u, t in (meta.get("served") or [])]
+        orig_texts = [str(t) for t in (meta.get("probe_texts") or [])]
+        ents = self._harvest_entities(served, query)
+        if not ents:
+            self._emit("reprobe_skipped", read_id=read_id, reason="no_entities")
+            return None
+        # THE POISON GUARD (design §two-stage, spelled out; measured on the
+        # Principality Madonna-cascade): strip NON-INITIAL capitalized tokens from
+        # every sub-question tail before pairing it with a harvested entity — the
+        # decomposer's hallucinated entities ride the tails, and the guard removes
+        # them mechanically with no knowledge of WHICH token is the poison (the
+        # replay gate measured the unguarded form re-poisoning the probes).
+        raw_tails = [str(t) for t in (meta.get("tails") or [])] or [query]
+        tails: list[str] = []
+        for t in raw_tails:
+            words = t.split()
+            if not words:
+                continue
+            guarded = _REPROBE_TAIL_Q.sub(
+                "", " ".join([words[0]] + [w for w in words[1:]
+                                           if not w[:1].isupper()])).strip()
+            if guarded:
+                tails.append(guarded)
+        tails = list(dict.fromkeys(tails)) or [query]
+        new_texts = [f"{e} — {t}" for e in ents for t in tails][:_REPROBE_PROBE_CAP]
+        hint_text = (hint or "").strip()
+        if hint_text:
+            new_texts.append(hint_text)
+        try:   # ONE batched embed round — the pass's only API cost
+            vecs = embed_texts(self._embedder, [query, *orig_texts, *new_texts])
+        except Exception:  # noqa: BLE001 — a second pass must never crash the app loop
+            logger.warning("reprobe embedding failed — self-skip", exc_info=True)
+            return None
+        qe = tuple(float(x) for x in vecs[0])
+        probes = [tuple(float(x) for x in v) for v in vecs[1:] if v and any(v)]
+        index = self._pool_index(ns)
+        cands = self._pool_scan(index, qe, probes)
+        fresh_rows = [(s, ref) for s, ref, fresh in cands if fresh]
+        cov0 = fresh_rows[0][0] if fresh_rows else 0.0
+        kept = self._pool_candidates(fresh_rows)
+        ordered, reranked, rerank_ms = self._pool_rank(query, kept)
+        picked, est_used, headers = self._pool_pack(ordered)
+        served_texts = [h.text for h in picked]
+        rendered = self._pool_render(picked, headers)
+        pool_claims = [RecalledClaim(claim=h.text, score=h.score, unit_id=h.unit_id)
+                       for h in picked]
+        top_owner = picked[0].unit_id if picked else ""
+        self._read_seq += 1
+        new_read_id = f"read-{self._read_seq}"
+        # the fresh read gets its own meta ring entry, so repair(new_read_id) can
+        # bridge from ITS served claims and reprobe chains compose
+        self._record_read_meta(
+            new_read_id, query, ns, tails, [*orig_texts, *new_texts],
+            [(h.unit_id, h.text) for h in picked])
+        self._emit(
+            "reprobe",
+            parent_read_id=read_id,
+            read_id=new_read_id,
+            entities=ents,
+            n_probes=len(probes),
+            n_claims=len(picked),
+            coverage=round(cov0, 4),
+            est_tokens=est_used,
+            reranked=reranked,
+            rerank_ms=rerank_ms,
+        )
+        served_sources, owner_ages = self._serve_surface(
+            [h.unit_id for h in picked], [])
+        return Result(
+            understanding={"claims": list(served_texts)},
+            evidence=[],
+            cache_hit=True,             # embeds only — zero synthesis by construction
+            unit_id=top_owner,
+            confidence=cov0,
+            namespace=ns,
+            related=[],                 # mechanical pass: no related-unit expansion
+            context={"pool": rendered, "serve": "pool",
+                     "understanding": {"claims": list(served_texts)}},
+            usage=None,
+            coverage=cov0,
+            escalated=False,
+            recalled=[],
+            pool=pool_claims,
+            needs_retrieval=cov0 < self._coverage_floor,
+            read_id=new_read_id,
+            sources=served_sources,
+            max_source_age_s=max(owner_ages, default=0.0),
+            probes=[query, *orig_texts, *new_texts],
+            probe_coverage=[],
+            gaps=[],
+            parent_read_id=read_id,
+        )
+
+    def serve_unserved(self, read_id: str) -> Result | None:
+        """THE POST-REPAIR REFUSAL RUNG (ROUND-COMPOSITION-VERDICT #3 /
+        LAB-refusal-residue recommended fix 2): when the answer is STILL a refusal
+        after repair -> re-get -> reprobe, force-pack what the chain located but the
+        ranker never served. All 15 measured retrieval-headroom refusals had the gold
+        unit in store; q053/q327 had 8 claims repaired FROM the missing gold doc
+        admitted-but-unserved — a packing race, not a discovery problem.
+
+        Returns a FRESH :class:`Result` whose payload force-packs, at the head:
+
+        (a) this read's question's admitted-but-unserved REPAIRED claims — the repair
+            ring is joined on ``(namespace, query)`` (the chain's ``repair()`` ran on
+            an earlier read_id of the same question), claims still present in their
+            fresh owning units and absent from THIS read's served payload;
+        (b) the top claims (query-cosine order, capped ``_UNSERVED_UNIT_CLAIMS``) of
+            the HIGHEST-SCORING constraint-matched unit ABSENT from the served
+            payload — read non-destructively from this read's banked ledger (the
+            ledger stays repair's food);
+
+        then the read's original served claims fill the remaining budget in served
+        order (the cross-article comparison context stays — 30/32 measured refusals
+        are cross-article consistency questions). Normal packing contract (est-token
+        budget, headers counted, at-least-one), normal provenance (headers + sources),
+        new ``read_id`` + ``parent_read_id`` link, own meta ring entry so chains
+        compose. One ``embed(query)`` call; no LLM, no retrieval, no store mutation.
+
+        NEVER auto-fires — an explicit app call (document as the rung AFTER reprobe;
+        default app-called). Fires only meaningfully: with no unserved candidates it
+        emits ``serve_unserved_skipped`` and returns ``None`` (a refusal is never a
+        correct answer, so like reprobe it cannot break one). ``read_id`` should be
+        the chain's latest ordinary ``get()`` read (the post-repair pass-2 read).
+        Raises only the read-path arming error."""
+        if self._read_path != "pool":
+            # Fail LOUD (reprobe/subs=/constraints= precedent): no pool, no pack.
+            raise ValueError("serve_unserved requires read_path='pool'")
+        meta = self._read_meta.get(read_id)
+        if meta is None:
+            self._emit("serve_unserved_skipped", read_id=read_id,
+                       reason="unknown_read")
+            return None
+        query = str(meta.get("query") or "")
+        ns = str(meta.get("ns") or "")
+        served = [(str(u), str(t)) for u, t in (meta.get("served") or [])]
+        served_uids = {u for u, _t in served}
+        seen: set[tuple[str, str]] = {(u, self._norm_text(t)) for u, t in served}
+
+        # (a) admitted-but-unserved repaired claims of this question, ring order;
+        # claims rebuilt away since admission never resurrect (owner row is the proof).
+        forced: list[tuple[str, str]] = []
+        n_repaired = 0
+        for rec in self._read_repairs.values():
+            if (str(rec.get("ns") or "") != ns
+                    or str(rec.get("query") or "") != query):
+                continue
+            for prov in rec.get("claims") or []:
+                uid = str(prov.get("unit_id") or "")
+                text = str(prov.get("claim") or "")
+                key = (uid, self._norm_text(text))
+                if not text or key in seen:
+                    continue
+                unit = self._units.get(uid)
+                if unit is None or not unit.is_fresh:
+                    continue
+                texts, _embs = self._atomic_rows(unit)
+                if text not in texts:
+                    continue
+                seen.add(key)
+                forced.append((uid, text))
+                n_repaired += 1
+
+        # (b) the ONE highest-scoring constraint-matched unit absent from the payload
+        # (banked ledger read non-destructively; scores are the banked query cosines).
+        best_uid = ""
+        best_score = -2.0
+        for entry in self._read_bank.get(read_id) or []:
+            if str(entry.get("origin") or "") != "constraints":
+                continue
+            uid = str(entry.get("unit_id") or "")
+            if not uid or uid in served_uids:
+                continue
+            unit = self._units.get(uid)
+            if unit is None or not unit.is_fresh:
+                continue
+            score = float(entry.get("score") or 0.0)
+            if score > best_score:
+                best_uid, best_score = uid, score
+
+        if not forced and not best_uid:
+            self._emit("serve_unserved_skipped", read_id=read_id,
+                       reason="no_candidates")
+            return None
+        try:   # the rung's only API cost: ONE embed(query) for claim-rank scores
+            qe = tuple(float(x) for x in self._embedder.embed(query))
+        except Exception:  # noqa: BLE001 — a refusal rung must never crash the app loop
+            logger.warning("serve_unserved embedding failed — self-skip", exc_info=True)
+            self._emit("serve_unserved_skipped", read_id=read_id,
+                       reason="embed_failed")
+            return None
+        n_unit_claims = 0
+        if best_uid:
+            texts, embs = self._atomic_rows(self._units[best_uid])
+            scored = [((cosine(qe, e) if e and any(e) else 0.0), i, t)
+                      for i, (t, e) in enumerate(zip(texts, embs)) if t]
+            scored.sort(key=lambda row: (-row[0], row[1]))
+            for _s, _i, t in scored[:_UNSERVED_UNIT_CLAIMS]:
+                key = (best_uid, self._norm_text(t))
+                if key in seen:
+                    continue
+                seen.add(key)
+                forced.append((best_uid, t))
+                n_unit_claims += 1
+        if not forced:
+            self._emit("serve_unserved_skipped", read_id=read_id,
+                       reason="no_candidates")
+            return None
+
+        def _hit(uid: str, text: str) -> _PoolHit:
+            unit = self._units.get(uid)
+            score, cidx = 0.0, -1
+            if unit is not None:
+                texts_u, embs_u = self._atomic_rows(unit)
+                for i, (t, e) in enumerate(zip(texts_u, embs_u)):
+                    if t == text:
+                        cidx = i
+                        if e and any(e):
+                            score = cosine(qe, e)
+                        break
+            return _PoolHit(score, uid, cidx, text)
+
+        # Force-packed head first, then the original served claims in served order —
+        # the packer's normal walk-and-stop contract does the budget arithmetic.
+        ordered = [_hit(u, t) for u, t in forced] + [_hit(u, t) for u, t in served]
+        picked, est_used, headers = self._pool_pack(ordered)
+        served_texts = [h.text for h in picked]
+        rendered = self._pool_render(picked, headers)
+        pool_claims = [RecalledClaim(claim=h.text, score=h.score, unit_id=h.unit_id)
+                       for h in picked]
+        top_owner = picked[0].unit_id if picked else ""
+        cov0 = picked[0].score if picked else 0.0
+        self._read_seq += 1
+        new_read_id = f"read-{self._read_seq}"
+        orig_texts = [str(t) for t in (meta.get("probe_texts") or [])]
+        # the fresh read gets its own meta ring entry, so chains compose
+        self._record_read_meta(
+            new_read_id, query, ns, [str(t) for t in (meta.get("tails") or [])],
+            orig_texts, [(h.unit_id, h.text) for h in picked])
+        self._emit(
+            "serve_unserved",
+            parent_read_id=read_id,
+            read_id=new_read_id,
+            n_repaired=n_repaired,
+            n_unit_claims=n_unit_claims,
+            unserved_unit=best_uid,
+            n_claims=len(picked),
+            est_tokens=est_used,
+        )
+        served_sources, owner_ages = self._serve_surface(
+            [h.unit_id for h in picked], [])
+        return Result(
+            understanding={"claims": list(served_texts)},
+            evidence=[],
+            cache_hit=True,             # embeds only — zero synthesis by construction
+            unit_id=top_owner,
+            confidence=cov0,
+            namespace=ns,
+            related=[],                 # mechanical pass: no related-unit expansion
+            context={"pool": rendered, "serve": "pool",
+                     "understanding": {"claims": list(served_texts)}},
+            usage=None,
+            coverage=cov0,
+            escalated=False,
+            recalled=[],
+            pool=pool_claims,
+            needs_retrieval=cov0 < self._coverage_floor,
+            read_id=new_read_id,
+            sources=served_sources,
+            max_source_age_s=max(owner_ages, default=0.0),
+            probes=[query, *orig_texts],
+            probe_coverage=[],
+            gaps=[],
+            parent_read_id=read_id,
+        )
 
     # ------------------------------------------- provenance + entity indexes
     def _reindex(self, unit: Cognition) -> None:

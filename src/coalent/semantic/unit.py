@@ -69,6 +69,9 @@ class Cognition:
     # --- v0.6 (opt-in query_keys): behavioral alternate retrieval keys ---
     query_keys: tuple[QueryKey, ...] = ()                 # confirmed keys persist; provisional
     #                                                       ones expire with the read ring
+    # --- v0.7 (ingest metadata): the dominant artifact's chunk meta, captured at build ---
+    source_meta: dict[str, str] = field(default_factory=dict)  # title/source/date (+ extras);
+    #                                                            empty = no meta at ingest
     status: Status = Status.FRESH
     freshness_epoch: float = field(default_factory=time.time)
     hits: int = 0

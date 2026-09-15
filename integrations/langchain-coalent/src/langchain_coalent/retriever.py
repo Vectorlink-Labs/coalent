@@ -95,6 +95,11 @@ class CoalentRetriever(BaseRetriever):
             "escalated": result.escalated,
             "unit_id": result.unit_id,
             "namespace": result.namespace,
+            # v0.7 read surface (additive keys; the boundary port): the read's own
+            # doubt, so a chain-side evaluator can act without drilling. gaps is
+            # non-empty only when the cache was built with gap_detector=True.
+            "needs_retrieval": result.needs_retrieval,
+            "gaps": list(result.gaps),
         }
         docs = [Document(page_content=render_payload(result), metadata=metadata)]
         if self.include_evidence:

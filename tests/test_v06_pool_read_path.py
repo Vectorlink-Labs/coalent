@@ -1143,8 +1143,9 @@ def test_pool_without_header_warns_once_at_construction() -> None:
 
 
 def test_pool_payload_always_attributed() -> None:
-    # F1 + the spec §7.1 fork default (measured: opaque "[source: art:N]" ids graded 0.6413
-    # vs the rich header's 0.7306 strict, n=605): with pool_header=None the library serves
+    # F1 + the header ladder (measured n=605 strict: opaque "[source: art:N]" ids 0.6413,
+    # "## query" 0.6777, the metadata header 0.7306): with pool_header=None the library
+    # serves the v0.7 ladder — ingest meta "[{title} | {source} | {date}]" first, else
     # "## " + unit.query[:60] (the build query carries source-identifying text), falling
     # back to "[source: {artifact_id}]" ONLY when the unit has no query text. It is still
     # UNABLE to serve an unattributed pool payload: a header line opens EVERY group.
@@ -1159,21 +1160,30 @@ def test_pool_payload_always_attributed() -> None:
     for g in groups:                                   # header line, then the claims
         assert g.splitlines()[0] == "## alpha value one"   # both units' birth query
         assert g.splitlines()[1].startswith("- ")
-    # The query prefix truncates at 60 chars.
+    # RUNG 1 — ingest metadata outranks the query rung; missing keys are skipped.
     uid = r.pool[0].unit_id
+    cache._units[uid].source_meta = {"title": "T", "source": "S", "date": "2026-08-11"}
+    assert cache._pool_header_text(uid) == "[T | S | 2026-08-11]"
+    cache._units[uid].source_meta = {"title": "T", "date": "2026-08-11"}
+    assert cache._pool_header_text(uid) == "[T | 2026-08-11]"
+    # All-empty meta values fall THROUGH the rung (never render "[]").
+    cache._units[uid].source_meta = {"title": " ", "extra": "x"}
+    assert cache._pool_header_text(uid).startswith("## ")
+    cache._units[uid].source_meta = {}
+    # RUNG 2 — the query prefix truncates at 60 chars.
     long_q = "q" * 100
     cache._units[uid].query = long_q
     assert cache._pool_header_text(uid) == "## " + "q" * 60
-    # A query-less unit falls back to the artifact id; evidence-less falls to its own id.
+    # RUNG 3 — a query-less unit falls back to the artifact id; evidence-less to its own id.
     cache._units[uid].query = ""
     assert cache._pool_header_text(uid) in ("[source: src:a]", "[source: src:b]")
     bare = _mk_unit("cog:bare", "", "", ["gamma"], "art:x")
     bare.evidence = ()
     cache._units["cog:bare"] = bare
     assert cache._pool_header_text("cog:bare") == "[source: cog:bare]"
-    # An explicit callback still overrides the default.
+    # An explicit callback still overrides the ENTIRE ladder, meta included.
     ret2 = InMemoryRetriever()
-    ret2.add("src:a", "alpha value one")
+    ret2.add("src:a", "alpha value one", meta={"title": "T"})
     custom = _pool(ret2, serve_gate=0.4, pool_header=lambda u: "## MINE")
     custom.get("alpha value one")
     assert custom.get("alpha one").context["pool"].startswith("## MINE\n")

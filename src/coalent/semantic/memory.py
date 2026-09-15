@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .embedding import Embedder, HashingEmbedder, cosine
 from .ports import Chunk, Retriever, Synthesis
@@ -28,9 +28,10 @@ class InMemoryRetriever:
         self._docs: list[tuple[Chunk, tuple[float, ...], str | None]] = []
 
     def add(
-        self, artifact_id: str, text: str, *, namespace: str | None = None, version: str = "v1"
+        self, artifact_id: str, text: str, *, namespace: str | None = None,
+        version: str = "v1", meta: Mapping[str, str] | None = None,
     ) -> None:
-        chunk = Chunk(artifact_id=artifact_id, text=text, version=version)
+        chunk = Chunk(artifact_id=artifact_id, text=text, version=version, meta=meta)
         self._docs.append((chunk, tuple(self._embedder.embed(text)), namespace))
 
     def retrieve(self, query: str, *, namespace: str | None = None) -> list[Chunk]:

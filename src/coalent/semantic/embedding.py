@@ -85,13 +85,26 @@ class OpenAIEmbedder:
         response = self._client.embeddings.create(model=self._model, input=text)
         return list(response.data[0].embedding)
 
+    # The OpenAI Embeddings API rejects requests with more than 2048 inputs — a hard
+    # provider limit, not a tunable. embed_many chunks transparently so a caller's
+    # "one batched call" contract survives any batch size (measured live: a >2048
+    # evidence-sentence hydration batch 400-failed and silently degraded the
+    # gap-detector feeder before this guard existed).
+    _MAX_INPUTS_PER_REQUEST = 2048
+
     def embed_many(self, texts: list[str]) -> list[list[float]]:
         """One batched API call for all texts — the v0.3 cost lever for per-claim
-        embedding (K claims in a single round-trip instead of K)."""
+        embedding (K claims in a single round-trip instead of K). Batches beyond the
+        provider's 2048-inputs-per-request limit are split into the minimum number of
+        sequential requests, order preserved."""
         if not texts:
             return []
-        response = self._client.embeddings.create(model=self._model, input=texts)
-        return [list(item.embedding) for item in response.data]
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self._MAX_INPUTS_PER_REQUEST):
+            response = self._client.embeddings.create(
+                model=self._model, input=texts[i:i + self._MAX_INPUTS_PER_REQUEST])
+            out.extend(list(item.embedding) for item in response.data)
+        return out
 
 
 class FunctionEmbedder:

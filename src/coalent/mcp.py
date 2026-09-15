@@ -28,8 +28,9 @@ documents: watched files are paragraph-chunked into the library's built-in vecto
 retriever, and every ``get_context`` call first does a cheap mtime/size scan — a file
 whose content hash actually changed fires ``source_changed`` (new files ingest, deleted
 files invalidate) BEFORE the read serves. You cannot get a stale answer after saving a
-file. Attribution ships the golden path automatically: ``pool_header`` is wired to
-``[{path} | modified {YYYY-MM-DD}]`` per source group — the measured 0.68-vs-0.73
+file. Attribution ships the golden path automatically: every ingested chunk carries
+v0.7 metadata (title = first H1 else filename, source = relpath, date = mtime), served
+as ``[{title} | {path} | {YYYY-MM-DD}]`` per source group — the measured 0.68-vs-0.73
 header-ladder gap (n=605 graded; see cache.py) never opens. Folder mode requires
 ``OPENAI_API_KEY`` (embedder + gpt-4o-mini build synthesis) and fails LOUD without it —
 never degrading to the lexical embedder (the pool-path guard's principle). Factory mode
@@ -88,6 +89,8 @@ DEFAULT_BUDGET = 1000
 _CHUNK_TARGET_CHARS = 1200
 _CHUNK_HARD_CAP_CHARS = 4000
 _PARA_SPLIT = re.compile(r"\n\s*\n")
+# The first markdown H1 line ("# Title") — the watched file's title for ingest metadata.
+_H1 = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
 
 _INSTALL_HINT = 'pip install "coalent[mcp,openai]"'
 
@@ -249,6 +252,22 @@ class WatchedCorpus:
         state = self._files.get(path)
         return datetime.fromtimestamp(state.mtime).strftime("%Y-%m-%d") if state else None
 
+    def file_meta(self, path: str) -> dict[str, str]:
+        """One watched file's v0.7 ingest metadata — the auto-wired ``Chunk.meta``:
+        title = the first markdown H1 (else the filename), source = the watch-relative
+        path (the artifact id itself), date = the last-ingested mtime (YYYY-MM-DD).
+        Files HAVE metadata, so folder mode ships the measured metadata header rung
+        (``[{title} | {source} | {date}]``) by default — never the bare fallbacks."""
+        match = _H1.search(self._texts.get(path, ""))
+        meta = {
+            "title": match.group(1) if match else path.rsplit("/", 1)[-1],
+            "source": path,
+        }
+        date = self.modified_date(path)
+        if date:
+            meta["date"] = date
+        return meta
+
     def peek(self) -> list[dict[str, Any]]:
         """Freshness states WITHOUT mutating (stat-compare only, no reads, no events):
         ``fresh`` / ``stale-pending`` (stat differs; resolved on the next scan — a bare
@@ -339,15 +358,16 @@ class WatchedCorpus:
         memo is batch-warmed first, so only genuinely new/changed chunk text costs an
         embedding call; the swap is atomic (build fully, then assign)."""
         assert self._embedder is not None     # only reachable in index mode
-        rows: list[tuple[str, str, str]] = []
+        rows: list[tuple[str, str, str, dict[str, str]]] = []
         for rel in sorted(self._texts):
             version = self._files[rel].content_hash
+            meta = self.file_meta(rel)        # one dict per file, shared by its chunks
             for chunk in chunk_paragraphs(self._texts[rel]):
-                rows.append((rel, chunk, version))
-        self._embedder.warm([text for _, text, _ in rows])
+                rows.append((rel, chunk, version, meta))
+        self._embedder.warm([text for _, text, _, _ in rows])
         retriever = InMemoryRetriever(embedder=self._embedder, top_k=self._top_k)
-        for rel, text, version in rows:
-            retriever.add(rel, text, version=version)
+        for rel, text, version, meta in rows:
+            retriever.add(rel, text, version=version, meta=meta)
         self._retriever = retriever
 
     # --------------------------------------------------------------- scan-table serde
@@ -624,14 +644,19 @@ class CoalentMCP:
         cache._on_event = chained
 
     def _pool_header(self, unit: Cognition) -> str:
-        """Folder mode's automatic attribution header: ``[{path} | modified
-        {YYYY-MM-DD}]`` from the unit's first evidence chunk (pool units are
-        source-anchored, one per file) and the corpus scan table's mtime. Files HAVE
-        metadata, so this deployment ships the measured golden path by default — the
-        0.68-vs-0.73 bare-header gap (cache.py's construction warning) cannot open
-        here. Falls back to the bare path, then to the library's default header shape,
-        when metadata is missing. Factory mode never wires this: attribution there is
-        the factory's ``pool_header=`` (the library warns at construction if absent)."""
+        """Folder mode's automatic attribution header. Units built from watched files
+        carry ``source_meta`` (v0.7 ingest metadata via ``WatchedCorpus.file_meta``:
+        title = first H1 else filename, source = relpath, date = mtime), which the
+        library's default ladder renders as ``[{title} | {path} | {YYYY-MM-DD}]``.
+        Files HAVE metadata, so this deployment ships the measured golden path by
+        default — the 0.68-vs-0.73 bare-header gap (cache.py's construction warning)
+        cannot open here. A pre-v0.7 unit (persisted before meta existed) keeps the v1
+        ``[{path} | modified {YYYY-MM-DD}]`` form from the scan table, then the bare
+        path, then the library's default header shape. Factory mode never wires this:
+        attribution there is the factory's ``pool_header=`` (the library warns at
+        construction if absent)."""
+        if unit.source_meta:
+            return SemanticCache._default_header(unit)
         artifact = unit.evidence[0].artifact_id if unit.evidence else ""
         if artifact:
             date = self.corpus.modified_date(artifact) if self.corpus else None
@@ -726,6 +751,13 @@ class CoalentMCP:
                 "read_id": result.read_id,
                 "sources": self._sources_of(result),
                 "cache_hit": result.cache_hit,
+                # v0.7 read surface (additive keys; the boundary port): the read's own
+                # coverage + doubt, so an MCP-side evaluator can act without drilling.
+                # gaps is non-empty only when the (factory-built) cache armed
+                # gap_detector=True — folder mode never arms it.
+                "coverage": round(result.coverage, 4),
+                "needs_retrieval": result.needs_retrieval,
+                "gaps": list(result.gaps),
             }
 
     def tool_report_refusal(self, read_id: str) -> dict[str, Any]:
@@ -812,8 +844,11 @@ class CoalentMCP:
             "anything a save touched BEFORE serving; in BYO mode the ingestion "
             "pipeline signals edits via source_changed. Returns the budget-packed "
             "fact payload with per-source attribution headers, the contributing "
-            "source ids, whether it was served from cache, and a read_id for "
-            "report_refusal / report_success."
+            "source ids, whether it was served from cache, a read_id for "
+            "report_refusal / report_success, plus the read's coverage score, a "
+            "needs_retrieval hint (the cache under-covered even after its own "
+            "recovery), and any detected gaps (empty unless the cache was built "
+            "with gap_detector=True)."
         ))
         server.add_tool(report_refusal, description=(
             "Your answerer refused over a get_context payload? Send that read_id. "

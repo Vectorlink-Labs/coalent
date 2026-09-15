@@ -142,7 +142,10 @@ async def _tool(client: Any, name: str, args: dict[str, Any] | None = None) -> d
     return payload
 
 
-_HEADER = r"\[{path} \| modified \d{{4}}-\d{{2}}-\d{{2}}\]"
+# v0.7: folder-mode units carry auto-wired ingest metadata, served by the library's
+# default ladder as [{title} | {path} | {date}]; these test files have no H1, so the
+# title falls back to the filename (== the top-level relpath).
+_HEADER = r"\[{title} \| {path} \| \d{{4}}-\d{{2}}-\d{{2}}\]"
 
 
 # ------------------------------------------------------------------------ G1 protocol
@@ -203,9 +206,13 @@ def test_g2_cold_build_then_warm_hit_attributed(tmp_path: Path) -> None:
             assert "42" in cold["context"] and "77" in cold["context"]
             # ATTRIBUTED: the auto pool_header heads EVERY served group with file metadata.
             for path in ("a.md", "b.md"):
-                assert re.search(_HEADER.format(path=path), cold["context"])
+                assert re.search(_HEADER.format(title=path, path=path), cold["context"])
             assert set(cold["sources"]) == {"a.md", "b.md"}
             assert cold["read_id"]
+            # v0.7 read surface (additive keys): coverage + doubt ride every payload.
+            assert isinstance(cold["coverage"], float)
+            assert isinstance(cold["needs_retrieval"], bool)
+            assert cold["gaps"] == []               # folder mode never arms gap_detector
             assert synth.calls == 2                 # one source-anchored build per file
             warm = await _tool(client, "get_context", {"query": "alpha gamma value"})
             assert warm["cache_hit"] is True
@@ -277,7 +284,8 @@ def test_g4_refusal_success_key_fires(tmp_path: Path) -> None:
             ref = await _tool(client, "report_refusal", {"read_id": r1["read_id"]})
             assert ref["payload"] is not None
             assert "[source excerpt] " + _G4_MISSED in ref["payload"]
-            assert re.search(_HEADER.format(path="notes.md"), ref["payload"])
+            assert re.search(_HEADER.format(title="notes.md", path="notes.md"),
+                             ref["payload"])
             # Unknown read_id: null payload, never an error.
             bogus = await _tool(client, "report_refusal", {"read_id": "bogus"})
             assert bogus["payload"] is None
@@ -706,6 +714,27 @@ def test_watched_corpus_scan_lifecycle(tmp_path: Path) -> None:
     s4 = reborn.scan()
     assert not s4.added and not s4.changed and not s4.removed
     assert reborn.retrieve("gamma value")            # …but the index is rebuilt and live
+
+
+def test_watched_corpus_file_meta_auto_wired(tmp_path: Path) -> None:
+    # v0.7 ingest metadata, auto-filled from the file: title = the first markdown H1
+    # (else the filename), source = the watch-relative path, date = the mtime date.
+    root = tmp_path / "docs"
+    _write(root / "guide.md", "# Alpha Guide\n\nAlpha beta value gamma kappa body.")
+    _write(root / "sub" / "notes.txt", "Beta kappa value memo, no heading.")
+    corpus = WatchedCorpus(root, embedder=FunctionEmbedder(_embed))
+    corpus.scan()
+    meta = corpus.file_meta("guide.md")
+    assert meta["title"] == "Alpha Guide"
+    assert meta["source"] == "guide.md"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", meta["date"])
+    sub = corpus.file_meta("sub/notes.txt")
+    assert sub["title"] == "notes.txt"               # no H1 -> FILENAME, not the relpath
+    assert sub["source"] == "sub/notes.txt"
+    # The wiring: every retrieved chunk carries its file's meta, so builds capture it
+    # as unit.source_meta and the library's default header serves the metadata rung.
+    by_artifact = {c.artifact_id: c.meta for c in corpus.retrieve("alpha beta value")}
+    assert by_artifact["guide.md"] == meta
 
 
 def test_chunk_paragraphs_merge_and_split() -> None:

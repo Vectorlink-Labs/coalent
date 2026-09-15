@@ -27,6 +27,10 @@ from langchain_core.vectorstores import VectorStore
 #: Metadata keys tried, in order, when mapping a Document to a Chunk artifact id.
 _ARTIFACT_METADATA_KEYS = ("artifact_id", "source", "id")
 
+#: Metadata keys copied into ``Chunk.meta`` when present (v0.7 ingest metadata —
+#: Coalent's built-in pool header renders them as ``[{title} | {source} | {date}]``).
+_META_KEYS = ("title", "source", "date")
+
 
 def document_to_chunk(doc: Document) -> Chunk:
     """Map one LangChain ``Document`` to a Coalent ``Chunk``.
@@ -43,9 +47,15 @@ def document_to_chunk(doc: Document) -> Chunk:
        With the fallback, ``source_changed`` can only target text you re-supply
        verbatim; give your documents a ``source`` for real invalidation.
 
-    ``metadata["version"]`` (if present) becomes ``Chunk.version``. Coalent's
-    ``Chunk`` is a frozen 4-field dataclass with no metadata dict, so remaining
-    metadata is not carried on the chunk (best-effort mapping, documented).
+    ``metadata["version"]`` (if present) becomes ``Chunk.version``. The v0.7 ingest-
+    metadata keys ``title``/``source``/``date`` (if present) are copied into
+    ``Chunk.meta`` — Coalent's built-in pool attribution header serves them as
+    ``[{title} | {source} | {date}]``. When ``source`` is absent but another meta
+    key is present, it falls back to the resolved artifact id (the natural source
+    identity) — never to the content-derived ``chunk:`` digest, and never alone:
+    a doc with NO meta keys maps to ``meta=None`` so the header ladder keeps its
+    measured query-title rung instead of downgrading to an opaque id line.
+    Remaining metadata is not carried on the chunk (best-effort mapping, documented).
     """
     artifact_id = ""
     for key in _ARTIFACT_METADATA_KEYS:
@@ -59,11 +69,19 @@ def document_to_chunk(doc: Document) -> Chunk:
     if not artifact_id:
         digest = hashlib.sha1(doc.page_content.encode("utf-8")).hexdigest()[:12]
         artifact_id = f"chunk:{digest}"
+    meta: dict[str, str] = {}
+    for key in _META_KEYS:
+        value = doc.metadata.get(key)
+        if value is not None and str(value).strip():
+            meta[key] = str(value)
+    if meta and "source" not in meta and not artifact_id.startswith("chunk:"):
+        meta["source"] = artifact_id
     version = doc.metadata.get("version")
     return Chunk(
         artifact_id=artifact_id,
         text=doc.page_content,
         version="" if version is None else str(version),
+        meta=meta or None,
     )
 
 

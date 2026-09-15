@@ -77,6 +77,9 @@ def test_lg2_cold_build_then_warm_hit(
     assert doc.metadata["cache_hit"] is False
     assert doc.metadata["read_id"] == "read-1"
     assert "policy:leave" in doc.metadata["sources"]
+    # v0.7 read surface (additive keys): doubt rides the document metadata.
+    assert isinstance(doc.metadata["needs_retrieval"], bool)
+    assert doc.metadata["gaps"] == []       # gap_detector not armed in this rig
     assert "21 days" in doc.page_content            # the answer fact is in the payload
     assert "[policy:leave]" in doc.page_content     # attributed (pool_header default)
     build_calls = len(chat.calls)
