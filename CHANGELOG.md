@@ -26,7 +26,7 @@ grader-blind string artifacts to a judge, never auto-accept).
 
 <!-- PROPOSED — pending user sanction -->
 - **Headline**: the full v0.7 composition (subs + gap detector + constraints feeding
-  refusal-gated repair, then serve_unserved, then reprobe — each rung firing only on
+  refusal-gated repair, then reprobe, then serve_unserved — each rung firing only on
   failure) measured **0.826 adjudicated (0.825 harness) vs 0.774 for the v0.6
   shipped-max baseline** on the same rig at an identical ~983-token serving budget:
   **+5.3 points with zero extra serving tokens**. <!-- PROPOSED — pending user sanction -->

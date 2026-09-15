@@ -266,10 +266,10 @@ if failed(answer):                               # the failure chain — each ru
     r2 = cache.get(question, subs=planner_subquestions)   # repaired claims now compete
     answer = my_answerer(r2.context["pool"])
     if failed(answer):
-        r3 = cache.serve_unserved(r2.read_id)    # force-pack admitted-but-unserved claims
+        r3 = cache.reprobe(r2.read_id)           # entity-probe re-rank of the same pool
         answer = my_answerer(r3.context["pool"]) if r3 else answer
     if failed(answer):
-        r4 = cache.reprobe(r2.read_id)           # entity-probe re-rank of the same pool
+        r4 = cache.serve_unserved(r2.read_id)    # last rung: force-pack admitted-but-unserved claims
         answer = my_answerer(r4.context["pool"]) if r4 else answer
 ```
 
