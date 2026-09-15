@@ -14,10 +14,35 @@ but buried, and `serve_unserved(read_id)` force-packs admitted-but-unserved clai
 a refusal. Two upstream parameters (`subs=`, `constraints=`) let a planner hand the read
 its decomposition and its metadata intent instead of the cache guessing.
 
-**Everything below is default-OFF and byte-inert until armed** — a 0.6 user who upgrades
-and touches nothing gets 0.6 behavior, byte for byte (pinned by dedicated inertness
-tests on every knob). The default read path does **not** flip in 0.7 (see the flip-gate
-status at the bottom of this entry).
+**One deliberate default changes in 0.7 — the read path; every NEW v0.7 knob is
+default-OFF and byte-inert until armed** (pinned by dedicated inertness tests on every
+knob). A 0.6 user who upgrades and touches nothing gets 0.6 behavior byte for byte on
+every axis EXCEPT the read path: under a semantic embedder the default now resolves to
+`read_path="pool"` (see "Changed — the default read path" below); pass
+`read_path="unit"` explicitly to keep the old default, byte-identical.
+
+### Changed — the default read path (BREAKING)
+
+- **`read_path` now defaults to `None` and resolves to `"pool"` whenever a semantic
+  embedder is available** — every keyed/real deployment (`OPENAI_API_KEY` set, or any
+  `embedder=` that is not the lexical `HashingEmbedder`). Pool is the measured path:
+  every published v0.6/v0.7 number was produced on it, and the flip criteria were met
+  by the 0.7 battery evidence (the failure-first composition at 0.826 adjudicated vs
+  the 0.774 v0.6 baseline at an identical serving budget) and the user's call of
+  2026-09-15. The unit path plateaued and is legacy.
+- **Keyless zero-config falls back to `read_path="unit"` with a loud warning** naming
+  the resolution rule and both remedies (set `OPENAI_API_KEY` / pass `embedder=`): the
+  pool path requires a semantic embedder by contract, so the constructor never guesses
+  pool under the lexical fallback — the same vouching rule the langchain factory
+  shipped in 0.6, now applied by the constructor itself. Explicit
+  `read_path="pool"` under `HashingEmbedder` still raises at construction (unchanged
+  guard).
+- **Escape hatch: explicit `read_path="unit"` stays fully supported and byte-identical**
+  to the pre-flip unit path (pinned), and an explicit `read_path` always wins over the
+  resolution. Consequently the v0.7 failure-chain knobs that require the pool path
+  (`query_keys`, `decompose`, `gap_detector`, `repair_extractor`, `subs=`,
+  `constraints=`) now arm out of the box under a semantic embedder instead of raising
+  until `read_path="pool"` was typed.
 
 Benchmark rig for the numbers below: the same frozen rig as every anchor since v0.5 —
 a 609-article news corpus, 605 held-out questions, gpt-4.1-mini answerer, strict grading,
@@ -137,13 +162,18 @@ grader-blind string artifacts to a judge, never auto-accept).
 ### v0.7 flip gates (pre-registered in 0.6.0) — status
 
 The 0.6.0 entry pre-registered five gates for flipping the default from
-`read_path="unit"` to `read_path="pool"` in v0.7. **The flip is not taken in 0.7.0**:
-gates (a) structured-template suite, (c) churn soak, and (d) the null suite were not
-run as pre-registered, so the default read path is unchanged and the pool path stays
-opt-in. Accordingly the deprecation clock has not started: `serve="pool"` (the v0.5
-preview) survives unchanged in 0.7 instead of being removed, the unit-path read knobs
-carry no `DeprecationWarning` yet, and the 3-month minimum-notice floor now counts from
-whichever future release takes the flip.
+`read_path="unit"` to `read_path="pool"` in v0.7. **The flip IS taken in 0.7.0** (see
+"Changed — the default read path" above) — on the strength of the 0.7 battery evidence
+(the full failure-first composition at 0.826 adjudicated vs the 0.774 v0.6 shipped-max
+baseline on the frozen n=605 rig, identical serving budget) and the user's explicit
+call of 2026-09-15, in place of the three pre-registered gates that were never run as
+specified ((a) structured-template suite, (c) churn soak, (d) the null suite). The flip
+is CONDITIONAL by design: the default resolves to pool only under a semantic embedder,
+because the pool path requires one by contract; the keyless `HashingEmbedder` fallback
+stays on the unit path with a loud warning. `read_path="unit"` remains fully supported
+and byte-identical when explicitly selected — an escape hatch, not a deprecation: no
+`DeprecationWarning` is added in 0.7.0, and `serve="pool"` (the v0.5 preview) survives
+unchanged.
 
 ## [0.6.2]
 

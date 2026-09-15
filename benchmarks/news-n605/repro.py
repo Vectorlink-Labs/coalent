@@ -287,8 +287,12 @@ def build_store(corpus: list[dict[str, Any]], emb: MemoEmbedder, out_dir: Path,
         synth = LLMSynthesizer(OpenAIProvider(client=_openai_client()), model=BUILD_MODEL,
                                max_tokens=BUILD_MAX_TOKENS, depth=BUILD_DEPTH,
                                instruction=EXTRACT_INSTRUCTION)
+        # read_path="unit" pinned (v0.7 flips the resolved default to pool under a
+        # semantic embedder): this throwaway cache exists only to BUILD one unit with
+        # the frozen store recipe — the published store was produced on this exact path.
         cache = SemanticCache(_One(), synth, embedder=emb, hit_threshold=HIT_THRESHOLD,
-                              coverage_floor=COVERAGE_FLOOR, residual_floor=RESIDUAL_FLOOR)
+                              coverage_floor=COVERAGE_FLOOR, residual_floor=RESIDUAL_FLOOR,
+                              read_path="unit")
         delay = 5.0
         for attempt in range(6):
             try:

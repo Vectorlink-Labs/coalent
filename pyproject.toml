@@ -66,6 +66,12 @@ addopts = "-q"
 markers = [
   "openai: v0.4 accuracy tier — needs a real OPENAI_API_KEY; skipped offline",
 ]
+filterwarnings = [
+  # v0.7 default-read-path resolution: the suite runs the hermetic HashingEmbedder
+  # (conftest), so every bare construction resolves to "unit" and would warn. The
+  # warning itself is pinned in test_v07_default_read_path.py via pytest.warns.
+  "ignore:coalent. read_path was not set:UserWarning",
+]
 
 [tool.ruff]
 line-length = 100

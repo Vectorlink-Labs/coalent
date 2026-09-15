@@ -47,7 +47,8 @@ def _warm(docs, **kw):  # type: ignore[no-untyped-def]
     holder: dict[str, object] = {}
     cache = SemanticCache(
         FunctionRetriever(lambda q, ns: [holder["chunk"]]), _AtomSynth(),
-        embedder=OpenAIEmbedder(), hit_threshold=0.0, enable_coverage_escalation=False, **kw,
+        embedder=OpenAIEmbedder(), hit_threshold=0.0, enable_coverage_escalation=False,
+        read_path="unit", **kw,
     )
     query_threshold = cache._threshold
     cache._threshold = 2.0

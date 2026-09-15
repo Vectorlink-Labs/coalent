@@ -33,7 +33,8 @@ def _crowded_cache(adaptive: bool) -> SemanticCache:
     exactly the score-inflation regime the warm-up experiment measured."""
     retriever = InMemoryRetriever()
     cache = SemanticCache(retriever, _Synth(), embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.30, coverage_floor=0.0, adaptive_hit=adaptive)
+                          hit_threshold=0.30, coverage_floor=0.0, adaptive_hit=adaptive,
+                          read_path="unit")
     topics = _AXES[1:11]
     for t in topics:
         retriever.add(f"src:{t}", f"common {t} fact")
@@ -72,7 +73,8 @@ def test_split_by_artifact_builds_one_unit_per_source() -> None:
                     Chunk(artifact_id="art:B", text="delta epsilon other topic")]
 
     cache = SemanticCache(MixedRetriever(), _Synth(), embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.99, coverage_floor=0.0, split_by_artifact=True)
+                          hit_threshold=0.99, coverage_floor=0.0, split_by_artifact=True,
+                          read_path="unit")
     cache.get("alpha beta")
     units = list(cache._units.values())
     assert len(units) == 2                         # dominant art:A unit + art:B sibling
@@ -88,7 +90,7 @@ def test_split_off_is_v04_behavior() -> None:
                     Chunk(artifact_id="art:B", text="delta fact")]
 
     cache = SemanticCache(MixedRetriever(), _Synth(), embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.99, coverage_floor=0.0)
+                          hit_threshold=0.99, coverage_floor=0.0, read_path="unit")
     cache.get("alpha")
     assert len(cache._units) == 1                  # default: one blended unit, unchanged
 
@@ -113,7 +115,7 @@ def test_provenance_admission_prevents_duplicate_understanding() -> None:
 
     cache = SemanticCache(HRRetriever(), _Synth(), embedder=FunctionEmbedder(_embed),
                           hit_threshold=0.99,            # score gate forced to MISS
-                          coverage_floor=0.0, provenance_admission=True)
+                          coverage_floor=0.0, provenance_admission=True, read_path="unit")
     r1 = cache.get("alpha beta")                          # first question -> builds
     assert r1.cache_hit is False and len(cache._units) == 1
     r2 = cache.get("gamma delta epsilon")                 # different question, same source
@@ -141,7 +143,7 @@ class WidenRetriever:
 def test_widening_builds_from_the_source_not_the_keyhole() -> None:
     cache = SemanticCache(WidenRetriever(), _Synth(), embedder=FunctionEmbedder(_embed),
                           hit_threshold=0.99, coverage_floor=0.0,
-                          split_by_artifact=True, widen_chunks=24)
+                          split_by_artifact=True, widen_chunks=24, read_path="unit")
     r = cache.get("alpha beta")
     unit = cache._units[r.unit_id]
     assert len(unit.evidence) == 6                    # the whole source, not 2 chunks
@@ -150,7 +152,8 @@ def test_widening_builds_from_the_source_not_the_keyhole() -> None:
 
 def test_widening_off_is_v04_behavior() -> None:
     cache = SemanticCache(WidenRetriever(), _Synth(), embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.99, coverage_floor=0.0, split_by_artifact=True)
+                          hit_threshold=0.99, coverage_floor=0.0, split_by_artifact=True,
+                          read_path="unit")
     r = cache.get("alpha beta")
     assert len(cache._units[r.unit_id].evidence) == 2  # keyhole preserved when OFF
 
@@ -173,13 +176,13 @@ def test_containment_admission_rebuilds_thin_units_widened() -> None:
     retriever = TwoPhase()
     cache = SemanticCache(retriever, _Synth(), embedder=FunctionEmbedder(_embed),
                           hit_threshold=0.99, coverage_floor=0.0, split_by_artifact=True,
-                          provenance_admission=True, widen_chunks=24)
+                          provenance_admission=True, widen_chunks=24, read_path="unit")
     cache.get("alpha beta")                           # keyhole? no — widening ON -> full
     # force a THIN unit to exercise the predicate: rebuild world with widening off first
     retriever2 = TwoPhase()
     thin = SemanticCache(retriever2, _Synth(), embedder=FunctionEmbedder(_embed),
                          hit_threshold=0.99, coverage_floor=0.0, split_by_artifact=True,
-                         provenance_admission=True, widen_chunks=24,
+                         provenance_admission=True, widen_chunks=24, read_path="unit",
                          source_fetcher=lambda a: [Chunk(artifact_id=a, text=t)
                                                    for t in WidenRetriever.CHUNKS])
     thin._widen_chunks = None                         # phase 0 builds a KEYHOLE unit

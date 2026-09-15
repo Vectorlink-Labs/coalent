@@ -33,7 +33,7 @@ def _pool_cache(**kw: object) -> SemanticCache:
     retriever = InMemoryRetriever()
     cache = SemanticCache(retriever, _Synth(), embedder=FunctionEmbedder(_embed),
                           hit_threshold=0.30, coverage_floor=0.0,
-                          serve="pool", **kw)  # type: ignore[arg-type]
+                          serve="pool", read_path="unit", **kw)  # type: ignore[arg-type]
     for t in ("alpha", "beta", "gamma"):
         retriever.add(f"src:{t}", f"{t} fact")      # disjoint sources: one topic per artifact
     for t in ("alpha", "beta", "gamma"):
@@ -107,7 +107,8 @@ def test_serve_param_validated() -> None:
 def test_pool_is_namespace_isolated() -> None:              # 0.5.1 fix (D1)
     retriever = InMemoryRetriever()
     cache = SemanticCache(retriever, _Synth(), embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.30, coverage_floor=0.0, serve="pool")
+                          hit_threshold=0.30, coverage_floor=0.0, serve="pool",
+                          read_path="unit")
     retriever.add("src:alpha", "alpha fact")
     retriever.add("src:beta", "beta fact")
     cache.get("common alpha", namespace="team-a")
@@ -122,7 +123,7 @@ def test_containment_ns_scoped_both_modes() -> None:        # 0.5.1 fix (D3)
     retriever = InMemoryRetriever()
     cache = SemanticCache(retriever, _Synth(), embedder=FunctionEmbedder(_embed),
                           hit_threshold=0.30, coverage_floor=0.0,
-                          provenance_admission=True)
+                          provenance_admission=True, read_path="unit")
     retriever.add("src:alpha", "alpha fact")
     cache.get("common alpha", namespace="team-a")           # team-a understands src:alpha
     n = len(cache._units)

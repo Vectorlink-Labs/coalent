@@ -117,7 +117,8 @@ def test_residual_spans_captured_at_build() -> None:
     synth = _ClaimSynth(["alpha value"])
     cache = SemanticCache(ret, synth,                                 # type: ignore[arg-type]
                           embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.99, coverage_floor=0.0, residual_spans=True)
+                          hit_threshold=0.99, coverage_floor=0.0, residual_spans=True,
+                          read_path="unit")
     r = cache.get("alpha value")
     unit = cache._units[r.unit_id]
     # Exactly the two UNCOVERED fact-bearing sentences: the covered one (claim cosine 1.0),
@@ -136,7 +137,8 @@ def test_residual_spans_captured_at_build() -> None:
 def _unit_cache(ret: _WordRetriever, synth: _ClaimSynth) -> SemanticCache:
     return SemanticCache(ret, synth,                                  # type: ignore[arg-type]
                          embedder=FunctionEmbedder(_embed),
-                         hit_threshold=0.99, coverage_floor=0.0, residual_spans=True)
+                         hit_threshold=0.99, coverage_floor=0.0, residual_spans=True,
+                         read_path="unit")
 
 
 def test_capture_requires_absent_hard_facts() -> None:
@@ -227,7 +229,8 @@ def test_span_serde_is_lightweight() -> None:
     ret.set("src:news", _DOC)
     cache = SemanticCache(ret, _ClaimSynth(["alpha value"]),          # type: ignore[arg-type]
                           embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.99, coverage_floor=0.0, residual_spans=True)
+                          hit_threshold=0.99, coverage_floor=0.0, residual_spans=True,
+                          read_path="unit")
     r = cache.get("alpha value")
     unit = cache._units[r.unit_id]
     assert unit.residual_spans
@@ -785,10 +788,12 @@ def test_query_keys_requires_pool_path() -> None:
     ret = _WordRetriever()
     with pytest.raises(ValueError, match="read_path='pool'"):
         SemanticCache(ret, _ClaimSynth(["a"]),                     # type: ignore[arg-type]
-                      embedder=FunctionEmbedder(_embed), query_keys=True)   # unit path
-    # The pool path constructs fine (and the OFF default never triggers the guard).
+                      embedder=FunctionEmbedder(_embed), query_keys=True,
+                      read_path="unit")
+    # Explicit unit with the knob OFF never triggers the guard (v0.7: the bare default
+    # resolves to pool under a semantic embedder, so the unit leg is pinned explicitly).
     SemanticCache(ret, _ClaimSynth(["a"]),                         # type: ignore[arg-type]
-                  embedder=FunctionEmbedder(_embed))
+                  embedder=FunctionEmbedder(_embed), read_path="unit")
     _pool(ret, _ClaimSynth(["a"]), query_keys=True)
 
 

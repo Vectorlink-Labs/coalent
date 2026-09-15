@@ -47,7 +47,7 @@ Every context layer is forced to trade off three things. Coalent is built to hol
 
 Coalent sits **above retrieval** — bring any retriever (vector DB, hybrid search, GraphRAG, tools, APIs). It's the freshness-and-reuse layer, not another retriever — deliberately the *opposite* of GraphRAG's build-the-whole-graph-upfront tax: **lightweight, independent units, built lazily only when a query actually needs one**, and refreshed by dirtying a single unit (no graph surgery).
 
-> **New in v0.6** — the **pool read path** (`read_path="pool"`): every read serves the token-budgeted, globally ranked fresh-claim pool. Measured on a 605-question news benchmark (strict grading): **0.731 accuracy @ 981 context tokens** — matching naive top-9 (0.711 @ 1,311) at **~25% fewer tokens**, and naive's best measured point (top-12: 0.731 @ 1,729) at **~43% fewer**. Plus a default-OFF **behavioral stack** — residual spans → refusal fallback → append-only repair → query keys — measured at **−33% refusals** and **+3.1 pts** on the same store. All opt-in; the default read path is unchanged v0.5 behavior. See [What's new](#whats-new-in-v06).
+> **New in v0.6** — the **pool read path** (`read_path="pool"`): every read serves the token-budgeted, globally ranked fresh-claim pool. Measured on a 605-question news benchmark (strict grading): **0.731 accuracy @ 981 context tokens** — matching naive top-9 (0.711 @ 1,311) at **~25% fewer tokens**, and naive's best measured point (top-12: 0.731 @ 1,729) at **~43% fewer**. Plus a default-OFF **behavioral stack** — residual spans → refusal fallback → append-only repair → query keys — measured at **−33% refusals** and **+3.1 pts** on the same store. All opt-in in 0.6 — and since **v0.7 the pool path is the default**: under a semantic embedder the read path resolves to `"pool"` automatically (`read_path="unit"` stays the byte-identical escape hatch). See [What's new in v0.7](#whats-new-in-v07).
 >
 > **New in v0.6.1** — the **MCP server**: `coalent-mcp` puts the cache one line away from Claude Code, Cursor, or any MCP client ([Use it from Claude Code / Cursor](#use-it-from-claude-code--cursor-mcp)), and **[`langchain-coalent`](#langchain)** makes your existing LangChain stack the cache's substrate. Both additive-only.
 
@@ -81,6 +81,10 @@ cache.source_changed("confluence:hr", text="Leave policy: now 25 days.")
 # the next matching read rebuilds just that one unit, lazily
 ```
 
+(The no-key demo above runs the classic **unit** read path — with no semantic embedder
+available, the cache says so loudly and falls back. Wire a real embedder, as below, and
+the default becomes the measured **pool** read path.)
+
 Wire in a real model — any text-in / text-out LLM works. In v0.4 the synthesizer builds **extractive** understanding by default (query-independent atomic claims that keep every fact), and the cache does **cross-unit recall** — both on automatically:
 
 ```python
@@ -91,11 +95,13 @@ cache = SemanticCache(
     LLMSynthesizer(OpenAIProvider(), model="gpt-4o-mini"),   # extract=True by default (v0.4)
     embedder=OpenAIEmbedder(),   # match queries by MEANING (recommended for real use)
 )
+# ^ with a semantic embedder, v0.7 resolves the default read path to "pool" — the
+#   measured path. Pass read_path="unit" for the pre-0.7 unit default, byte-identical.
 # Multi-hop across documents? recall is already on; raise its trigger to bridge units:
 #   SemanticCache(retriever, synth, embedder=..., recall_threshold=0.7)
 ```
 
-**The v0.6 pool read path** — opt in, and every read serves the budget-packed, globally ranked fresh-claim pool instead of one routed unit. Attribution is the one thing to wire: a 3-line `pool_header` callable mapping each unit to `[title | source | date]` from your own corpus metadata. This is the measured golden path — on a 605-question news benchmark (strict grading), **0.68** accuracy with the bare built-in header vs **0.73** with this callable, same store, same queries:
+**The pool read path — the DEFAULT since v0.7** (whenever a semantic embedder is available): every read serves the budget-packed, globally ranked fresh-claim pool instead of one routed unit. Attribution is the one thing to wire: a 3-line `pool_header` callable mapping each unit to `[title | source | date]` from your own corpus metadata. This is the measured golden path — on a 605-question news benchmark (strict grading), **0.68** accuracy with the bare built-in header vs **0.73** with this callable, same store, same queries:
 
 ```python
 DOC_META = {  # your corpus metadata, keyed by artifact id
@@ -107,7 +113,7 @@ def pool_header(unit) -> str:   # the [title | source | date] golden path — 3 
     return f"[{meta['title']} | {meta['source']} | {meta['date']}]" if meta else f"[source: {unit.id}]"
 
 cache = SemanticCache(retriever, synthesizer, embedder=OpenAIEmbedder(),
-                      read_path="pool", pool_header=pool_header)
+                      pool_header=pool_header)   # pool is the resolved default (v0.7)
 result = cache.get("which regions got the refresh?")
 result.context["pool"]   # the packed, attributed claim payload — hand it to your answer model
 ```
@@ -227,11 +233,12 @@ as a runnable LangGraph-shaped example in the package. Depends only on `coalent>
 
 ## What's new in v0.7
 
-The self-healing release. The read now ships its own doubt, and the cache gains an
-explicit failure chain your agent drives — each rung fires **only on a failed read**, so
-a read that succeeds pays nothing new. **Everything is default-OFF and byte-inert until
-armed** (pinned by tests): a 0.6 user who upgrades and touches nothing gets 0.6 behavior,
-byte for byte. Full details in the [CHANGELOG](CHANGELOG.md).
+The self-healing release — and the release that **flips the default read path**. The
+read now ships its own doubt, and the cache gains an explicit failure chain your agent
+drives — each rung fires **only on a failed read**, so a read that succeeds pays nothing
+new. One deliberate default changes (the read path, first item below); **every NEW v0.7
+knob is default-OFF and byte-inert until armed** (pinned by tests). Full details in the
+[CHANGELOG](CHANGELOG.md).
 
 <!-- SANCTIONED 2026-09-15: every number in the next paragraph -->
 Measured on the same frozen news rig as every anchor since v0.5 (609 articles, 605
@@ -245,7 +252,7 @@ The agentic loop — your evaluator decides, the cache heals:
 ```python
 cache = SemanticCache(
     retriever, synthesizer, embedder=OpenAIEmbedder(),
-    read_path="pool",
+    # read_path resolves to "pool" automatically under a semantic embedder (v0.7 default)
     gap_detector=True,               # observe-only: the read reports its own holes
     repair_extractor=my_extractor,   # BYO callable(span, region, existing_claims) -> [claims]
 )
@@ -272,6 +279,15 @@ if failed(answer):                               # the failure chain — each ru
         answer = my_answerer(r4.context["pool"]) if r4 else answer
 ```
 
+- **BREAKING — the default read path resolves to pool.** `read_path` now defaults to
+  `None` and resolves to `"pool"` whenever a semantic embedder is available — every
+  keyed/real deployment (`OPENAI_API_KEY` set, or any non-lexical `embedder=`). Pool is
+  the measured path (every published v0.6/v0.7 number; the flip criteria were met by
+  the 0.7 battery evidence — 0.826 vs 0.774 above). Keyless zero-config falls back to
+  the unit path with a **loud warning** naming both remedies (set `OPENAI_API_KEY` /
+  pass `embedder=`). **Escape hatch:** explicit `read_path="unit"` stays fully
+  supported and byte-identical to the pre-0.7 default; an explicit `read_path` always
+  wins over the resolution.
 - **The read ships its own provenance and doubt.** `Result.sources` (the artifact ids
   actually behind the payload), `Result.max_source_age_s` (the serve's freshness age),
   and — with `gap_detector=True` — `Result.probes` / `probe_coverage` / `gaps`: per
@@ -300,21 +316,24 @@ if failed(answer):                               # the failure chain — each ru
   ..., "source": ..., "date": ...})` puts the metadata ON the unit (`source_meta`), and
   the default pool header renders the measured `[title | source | date]` golden path
   without the `pool_header` callable. Meta-less ingests are byte-identical to 0.6.
-- **Deprecation status:** the pool-path default flip pre-registered in 0.6.0 is **not
-  taken** in 0.7.0 (three of the five gates were not run), so `read_path="unit"` remains
-  the default, `serve="pool"` survives unchanged (its removal clock now counts from
-  whichever release takes the flip), and no unit-path knob warns yet.
+- **Flip status:** the pool-path default flip pre-registered in 0.6.0 **is taken in
+  0.7.0** — on the 0.7 battery evidence and an explicit maintainer call (2026-09-15), in
+  place of the three pre-registered gates that were never run as specified. It is
+  conditional by design (pool requires a semantic embedder by contract, so the lexical
+  fallback stays on unit, loudly). Not a deprecation: `read_path="unit"` stays fully
+  supported with no `DeprecationWarning`, and `serve="pool"` (the v0.5 preview)
+  survives unchanged in 0.7.
 
 ## What's new in v0.6
 
 The pool-first release. Every n=605 number below comes from one frozen rig — a 609-article news corpus, 605 held-out questions, gpt-4.1-mini answerer, strict grading — the same rig the v0.5 numbers were measured on. Full details in the [CHANGELOG](CHANGELOG.md) and [UPGRADE-0.5-to-0.6.md](UPGRADE-0.5-to-0.6.md).
 
-- **`read_path="pool"` — the claim-pool-first read path (opt-in).** Reads are answered by budget-packing the global fresh-claim pool; units remain the ownership / freshness / provenance skeleton. Measured: **0.731 strict accuracy @ 981 mean context tokens** — matching naive top-9 (0.711 @ 1,311) at **~25% fewer tokens** and naive's best measured point (top-12: 0.731 @ 1,729) at **~43% fewer**. The claim is **parity at fewer tokens** (CIs overlap) — not an accuracy beat. Gold-claim serving rank: **p50/p75/p90 = 1/6/15** in pool order.
+- **`read_path="pool"` — the claim-pool-first read path** (opt-in in 0.6; **the resolved default since v0.7** under a semantic embedder). Reads are answered by budget-packing the global fresh-claim pool; units remain the ownership / freshness / provenance skeleton. Measured: **0.731 strict accuracy @ 981 mean context tokens** — matching naive top-9 (0.711 @ 1,311) at **~25% fewer tokens** and naive's best measured point (top-12: 0.731 @ 1,729) at **~43% fewer**. The claim is **parity at fewer tokens** (CIs overlap) — not an accuracy beat. Gold-claim serving rank: **p50/p75/p90 = 1/6/15** in pool order.
 - **Attribution by default, and a measured header ladder.** `pool_header=None` now renders a built-in per-source header. Same store, same queries: opaque id **0.641** → shipping default **0.678** → your `[title | source | date]` metadata callable **0.731**. The gap is a *unit-metadata* limit (outlet/date live in your corpus, not on the unit) — wire the callable (quickstart above).
 - **The behavioral stack (all default-OFF): spans → fallback → repair → keys.** `residual_spans=True` captures fact-bearing sentences the extractor missed as tier-2 spans on the unit (never in the pool). When *your* answerer refuses, `report_refusal(read_id)` returns an attributed retry payload; `report_success(read_id)` confirms the rescue and — with `query_keys=True` — earns a durable alternate key; lossy-marked units self-repair **append-only** on their next rebuild. Measured, driven through the full loop: refusals **91 → 61 (−33%)**, **+3.1 pts** final accuracy at **+2.1% tokens** (same-store comparison), **zero newly-wrong answers**; keyed-class first-pass **0% → 61%** on paraphrase revisits.
 - **Adaptive serve gate** (`serve_gate=None`) — adapts against the pool's own noise ceiling; an explicit float disables adaptation (reproducible benches). Shipped only after a $0 replay gate: 605/605 identical serve decisions on both arms, zero builds, zero LLM calls.
 - **Hardening & plumbing:** every payload surface carries source attribution (pool payload and escalation raw); cross-owner near-duplicate claims are kept as corroboration; 14 new observability events (`pool_served`, `residual_fallback`, `key_confirmed`, ...); `reranker` hook (serving order only — it can never cause a false serve); `claim_index` BYO pool storage; a v0.5 pool-preview stale-serve hole is fixed.
-- **Deprecated:** `serve="pool"` (the v0.5 preview) — still works verbatim in 0.6, removed in v0.7; migrate to `read_path="pool"`. The default read path stays `"unit"` (exact v0.5 behavior); flipping the default is a v0.7 decision behind five pre-registered gates, of which only one (the replay gate) has passed.
+- **Deprecated:** `serve="pool"` (the v0.5 preview) — still works verbatim in 0.6 and 0.7; migrate to `read_path="pool"`. In 0.6 the default read path stayed `"unit"` (exact v0.5 behavior) behind five pre-registered flip gates — **v0.7 took the flip** (see [What's new in v0.7](#whats-new-in-v07)).
 
 ### Honest limits (measured, not hypothetical)
 
@@ -339,7 +358,7 @@ The pool release — everything a month-long, pre-registered benchmark war on re
   cache grows (fixed thresholds provably absorb everything at scale).
 - **Pool serving preview** (`serve="pool"`, `serve_budget=600`, `pool_header=...`) — serve the
   token-budgeted, globally ranked fresh-claim pool instead of one routed unit (**experimental**;
-  superseded by `read_path="pool"` in v0.6 — the preview still works in 0.6, removed in v0.7).
+  superseded by `read_path="pool"` in v0.6 — the preview still works verbatim in 0.6 and 0.7).
   Held-out n=605: 0.699 accuracy vs 0.579 for unit serving (z=6.66); statistically ties naive's
   k9 arm — its best measured at the time — at 0.79× its tokens; 95% null honesty.
   Stale units' claims are masked from the pool the moment a source changes.
@@ -384,7 +403,7 @@ Unchanged content is skipped via a content-hash compare, so a no-op change costs
 
 ## The read path — a ladder of gates
 
-This is the **default unit read path** (`read_path="unit"`, exact v0.5 behavior). The opt-in v0.6 [pool path](#whats-new-in-v06) replaces unit routing with global claim-pool packing and makes these unit-routing knobs inert; its own knobs are in [UPGRADE-0.5-to-0.6.md](UPGRADE-0.5-to-0.6.md).
+This is the **unit read path** (`read_path="unit"` — exact v0.5 behavior; the keyless fallback, and the byte-identical escape hatch from the v0.7 pool default). The v0.6 [pool path](#whats-new-in-v06) — **the resolved default since v0.7** under a semantic embedder — replaces unit routing with global claim-pool packing and makes these unit-routing knobs inert; its own knobs are in [UPGRADE-0.5-to-0.6.md](UPGRADE-0.5-to-0.6.md).
 
 Coalent keys on what a unit **knows** — an embedding of its *understanding*, not the query's words — so *"how many vacation days?"* hits your leave unit, while *"exchange policy"* does **not**. Every `get(query)` then walks a fixed ladder of gates. The defaults are **pure cosine** — no extra model, no heavy dependency — and each gate is a tunable knob. In firing order:
 

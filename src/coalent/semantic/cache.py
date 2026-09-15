@@ -347,7 +347,17 @@ class FreshnessPolicy:
 class SemanticCache:
     """Embedding-keyed cognitive cache over understanding + raw evidence.
 
-    **The read flow (every knob is additive; the defaults reproduce v0.3):**
+    **v0.7 BREAKING — the default read path resolves.** ``read_path`` defaults to ``None``
+    and resolves at construction: ``"pool"`` (the measured pool-first read path, the basis
+    of every published v0.6/v0.7 number) whenever the resolved embedder is semantic —
+    anything but the lexical :class:`HashingEmbedder` — and ``"unit"``, with a loud
+    warning naming the rule, under the keyless ``HashingEmbedder`` fallback. An explicit
+    ``read_path="unit"`` or ``"pool"`` always wins and behaves exactly as pre-0.7
+    (``read_path="unit"`` is the byte-identical escape hatch; explicit ``"pool"`` under
+    ``HashingEmbedder`` still raises at construction).
+
+    **The unit read flow (``read_path="unit"``; every knob is additive; the defaults
+    reproduce v0.3):**
 
     1. *Match* a unit by meaning (``0.7·cos(query, understanding) + 0.3·cos(query, seed)``).
     2. *Cover* — the query's max per-claim cosine to the unit's atoms.
@@ -391,7 +401,7 @@ class SemanticCache:
         serve: str = "unit",
         serve_budget: int | None = None,
         pool_header: Callable[[Cognition], str] | None = None,
-        read_path: str = "unit",
+        read_path: str | None = None,
         serve_gate: float | None = None,
         reranker: Callable[[str, list[str]], list[float]] | None = None,
         fast: bool | str = "auto",
@@ -491,10 +501,33 @@ class SemanticCache:
         if serve not in ("unit", "pool"):
             raise ValueError(f"serve must be 'unit' or 'pool', got {serve!r}")
         self._serve = serve
-        # v0.6 — the pool-first read path (spec §2). Opt-in via read_path="pool"; the default
-        # "unit" is byte-identical v0.5. Pool mode REQUIRES a semantic embedder (constructor-time
-        # guard): under the lexical HashingEmbedder, claim cosine collapses to keyword overlap and
-        # the whole gate/ranking substrate would amplify keyword coincidence.
+        # v0.7 BREAKING (user ruling 2026-09-15) — the default read path RESOLVES instead of
+        # pinning "unit": read_path=None (the new default) becomes "pool" whenever the resolved
+        # embedder is semantic (anything but the lexical HashingEmbedder — the exact
+        # classification the pool guard below enforces, and the same vouching rule the
+        # langchain factory shipped in 0.6), else falls back to "unit" LOUDLY. Pool is the
+        # measured path (every published v0.6/v0.7 number); unit plateaued and stays the
+        # byte-identical escape hatch. An EXPLICIT read_path always wins and behaves exactly
+        # as before — including the pool-requires-semantic-embedder constructor error.
+        if read_path is None:
+            if isinstance(self._embedder, HashingEmbedder):
+                read_path = "unit"
+                warnings.warn(
+                    "coalent: read_path was not set and the embedder is the lexical "
+                    "HashingEmbedder, so this cache runs read_path='unit' — the default "
+                    "resolves to the measured 'pool' path only under a semantic embedder. "
+                    "For the pool path: set OPENAI_API_KEY (with `pip install "
+                    "coalent[openai]`) or pass embedder=<semantic embedder>. Pass "
+                    "read_path='unit' explicitly to keep the unit path and silence this "
+                    "warning.",
+                    stacklevel=2,
+                )
+            else:
+                read_path = "pool"
+        # v0.6 — the pool-first read path (spec §2). Pool mode REQUIRES a semantic embedder
+        # (constructor-time guard): under the lexical HashingEmbedder, claim cosine collapses
+        # to keyword overlap and the whole gate/ranking substrate would amplify keyword
+        # coincidence. Explicit read_path="unit" is byte-identical v0.5.
         if read_path not in ("unit", "pool"):
             raise ValueError(f"read_path must be 'unit' or 'pool', got {read_path!r}")
         if read_path == "pool" and isinstance(self._embedder, HashingEmbedder):
@@ -921,7 +954,8 @@ class SemanticCache:
             # class a measured forensic run paid for).
             raise ValueError("subs=/constraints= require read_path='pool'")
         if self._read_path == "pool":
-            # v0.6 — the pool-first read path (opt-in). The unit path below stays byte-identical.
+            # v0.6 pool-first read path — the v0.7 resolved default under a semantic
+            # embedder. The unit path below stays byte-identical (explicit read_path="unit").
             return self._pool_read(query, namespace=namespace, related=related,
                                    strategy=strategy, subs=subs, constraints=constraints)
         strat = strategy or self._strategy

@@ -34,7 +34,7 @@ class _LossyCardSynth:
 def _cache(**kw: object) -> SemanticCache:
     retriever = InMemoryRetriever()
     retriever.add("doc:cards", "lost or stolen cards can be replaced with the order number")
-    defaults: dict[str, object] = dict(hit_threshold=0.4, coverage_floor=0.6)
+    defaults: dict[str, object] = dict(hit_threshold=0.4, coverage_floor=0.6, read_path="unit")
     defaults.update(kw)
     return SemanticCache(
         retriever, _LossyCardSynth(), embedder=FunctionEmbedder(_axis_embed), **defaults

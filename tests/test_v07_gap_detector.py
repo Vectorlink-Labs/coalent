@@ -123,7 +123,7 @@ def test_gap_detector_constructor_contract() -> None:
     # structurally inert on the unit path -> fail LOUD (query_keys/decompose precedent)
     with pytest.raises(ValueError, match="gap_detector requires read_path='pool'"):
         SemanticCache(ret, synth, embedder=FunctionEmbedder(_embed),  # type: ignore[arg-type]
-                      gap_detector=True)
+                      gap_detector=True, read_path="unit")
     # SPEC DELTA pin: residual_spans is NOT required — the detector hydrates its own
     # evidence-sentence tier (the residual tier was measured dead as its span source).
     _pool(ret, synth, gap_detector=True)

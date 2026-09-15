@@ -131,7 +131,7 @@ def test_repair_constructor_and_arming_contract() -> None:
     # structurally inert on the unit path -> fail LOUD (gap_detector precedent)
     with pytest.raises(ValueError, match="repair_extractor requires read_path='pool'"):
         SemanticCache(ret, synth, embedder=FunctionEmbedder(_embed),  # type: ignore[arg-type]
-                      repair_extractor=_Extractor())
+                      repair_extractor=_Extractor(), read_path="unit")
     # a non-callable arm is a contract error (the library never calls an LLM)
     with pytest.raises(TypeError, match="repair_extractor must be None or a callable"):
         SemanticCache(ret, synth, embedder=FunctionEmbedder(_embed),  # type: ignore[arg-type]

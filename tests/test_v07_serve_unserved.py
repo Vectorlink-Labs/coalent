@@ -217,6 +217,6 @@ def test_unit_path_fails_loud() -> None:
     ret.set("src:a", _A_SENT)
     unit_cache = SemanticCache(ret, _ClaimSynth(["alpha value"]),     # type: ignore[arg-type]
                                embedder=FunctionEmbedder(_embed),
-                               hit_threshold=0.5, coverage_floor=0.0)
+                               hit_threshold=0.5, coverage_floor=0.0, read_path="unit")
     with pytest.raises(ValueError, match="requires read_path='pool'"):
         unit_cache.serve_unserved("read-1")

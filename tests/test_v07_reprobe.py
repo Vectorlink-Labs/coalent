@@ -156,7 +156,7 @@ def test_unknown_read_returns_none_and_unit_path_fails_loud() -> None:
     cache, _rid = _hop_world()
     assert cache.reprobe("read-999") is None
     unit_cache = SemanticCache(_WordRetriever(), _ClaimSynth(["a"]),  # type: ignore[arg-type]
-                               embedder=FunctionEmbedder(_embed))
+                               embedder=FunctionEmbedder(_embed), read_path="unit")
     with pytest.raises(ValueError, match="reprobe requires read_path='pool'"):
         unit_cache.reprobe("read-1")
 

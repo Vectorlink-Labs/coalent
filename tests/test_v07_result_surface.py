@@ -131,7 +131,7 @@ def test_unit_path_result_surface() -> None:
     ret.set("src:a", "alpha value gamma.")
     cache = SemanticCache(ret, _ClaimSynth(["alpha value"]),          # type: ignore[arg-type]
                           embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.5, coverage_floor=0.0)
+                          hit_threshold=0.5, coverage_floor=0.0, read_path="unit")
     r = cache.get("alpha value gamma")
     assert r.read_id.startswith("read-")
     assert r.sources == ["src:a"]                         # the served evidence's artifacts

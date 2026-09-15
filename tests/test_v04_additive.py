@@ -90,7 +90,8 @@ def _select_cache(**kw: object) -> SemanticCache:
     retriever.add("d", "alice france; alice bob capital france germany")
     cache = SemanticCache(
         retriever, _AtomSynth(), embedder=_fe(),
-        hit_threshold=0.2, enable_coverage_escalation=False, **kw,  # type: ignore[arg-type]
+        hit_threshold=0.2, enable_coverage_escalation=False, read_path="unit",
+        **kw,  # type: ignore[arg-type]
     )
     cache.get("alice france alice bob capital france germany")  # build the unit
     return cache
@@ -130,7 +131,8 @@ def _residual_cache(**kw: object) -> tuple[SemanticCache, str]:
     retriever.add("policy", "alice leads team. limit 21 days sick leave.")  # number in sentence 2
     cache = SemanticCache(
         retriever, _LossySynth(), embedder=_fe(),
-        hit_threshold=0.2, enable_coverage_escalation=False, **kw,  # type: ignore[arg-type]
+        hit_threshold=0.2, enable_coverage_escalation=False, read_path="unit",
+        **kw,  # type: ignore[arg-type]
     )
     result = cache.get("alice leads team")
     return cache, result.unit_id
@@ -162,14 +164,15 @@ def test_residual_atoms_survive_a_store_reload_parallel_to_embeddings(tmp_path) 
     store1 = SQLiteCognitionStore(db)
     cache1 = SemanticCache(
         retriever, _LossySynth(), embedder=_fe(), hit_threshold=0.2,
-        enable_coverage_escalation=False, residual_floor=0.3, store=store1,
+        enable_coverage_escalation=False, residual_floor=0.3, store=store1, read_path="unit",
     )
     uid = cache1.get("alice leads team").unit_id
     store1.close()
 
     # Fresh cache over the same DB — units are reloaded from serde, not rebuilt.
     cache2 = SemanticCache(
-        retriever, _LossySynth(), embedder=_fe(), hit_threshold=0.2, store=SQLiteCognitionStore(db),
+        retriever, _LossySynth(), embedder=_fe(), hit_threshold=0.2,
+        store=SQLiteCognitionStore(db), read_path="unit",
     )
     unit = cache2._units[uid]
     claim_texts = cache2._claim_texts(unit.understanding)          # [claims..., summary]
@@ -188,7 +191,8 @@ def _two_unit_cache(**kw: object) -> SemanticCache:
     exactly the ambiguous routing case hit_margin should catch."""
     retriever = InMemoryRetriever(top_k=1)
     cache = SemanticCache(
-        retriever, _AtomSynth(), embedder=_fe(), hit_threshold=0.35, **kw,  # type: ignore[arg-type]
+        retriever, _AtomSynth(), embedder=_fe(), hit_threshold=0.35, read_path="unit",
+        **kw,  # type: ignore[arg-type]
     )
     retriever.add("d1", "france paris")
     cache.get("france paris")
@@ -218,6 +222,7 @@ def test_hit_margin_never_blocks_a_lone_unit() -> None:
     retriever = InMemoryRetriever(top_k=1)
     cache = SemanticCache(
         retriever, _AtomSynth(), embedder=_fe(), hit_threshold=0.35, hit_margin=0.9,
+        read_path="unit",
     )
     retriever.add("d", "france paris")
     cache.get("france paris")

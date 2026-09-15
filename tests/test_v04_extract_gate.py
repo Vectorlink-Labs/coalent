@@ -73,7 +73,7 @@ def _extractive_cache():  # type: ignore[no-untyped-def]
     cache = SemanticCache(
         FunctionRetriever(lambda q, ns: list(cs)),
         LLMSynthesizer(OpenAIProvider(), model="gpt-4o-mini", extract=True, max_tokens=1200),
-        embedder=OpenAIEmbedder(), hit_threshold=0.0, coverage_floor=0.4,
+        embedder=OpenAIEmbedder(), hit_threshold=0.0, coverage_floor=0.4, read_path="unit",
         enable_coverage_escalation=True,
     )
     cache.get("summarize this document")   # neutral build query -> the ONE extractive unit

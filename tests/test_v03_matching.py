@@ -56,7 +56,8 @@ def _kb() -> InMemoryRetriever:
 
 def _cache() -> SemanticCache:
     return SemanticCache(
-        _kb(), _EchoSynth(), embedder=FunctionEmbedder(_sem_embed), hit_threshold=0.55
+        _kb(), _EchoSynth(), embedder=FunctionEmbedder(_sem_embed), hit_threshold=0.55,
+        read_path="unit",
     )
 
 
@@ -95,7 +96,7 @@ def test_legacy_unit_backfills_on_load(tmp_path) -> None:  # type: ignore[no-unt
 
     store1 = SQLiteCognitionStore(db)
     c1 = SemanticCache(
-        _kb(), _EchoSynth(), embedder=FunctionEmbedder(_sem_embed), store=store1, hit_threshold=0.55
+        _kb(), _EchoSynth(), embedder=FunctionEmbedder(_sem_embed), store=store1, hit_threshold=0.55, read_path="unit"
     )
     built = c1.get("leave policy")
     unit = c1._units[built.unit_id]
@@ -106,7 +107,7 @@ def test_legacy_unit_backfills_on_load(tmp_path) -> None:  # type: ignore[no-unt
 
     store2 = SQLiteCognitionStore(db)
     c2 = SemanticCache(
-        _kb(), _EchoSynth(), embedder=FunctionEmbedder(_sem_embed), store=store2, hit_threshold=0.55
+        _kb(), _EchoSynth(), embedder=FunctionEmbedder(_sem_embed), store=store2, hit_threshold=0.55, read_path="unit"
     )
     reloaded = c2._units[built.unit_id]
     assert reloaded.understanding_embedding != ()  # backfilled on load

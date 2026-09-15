@@ -110,8 +110,12 @@ class _Semantic:
 
     def __init__(self, corpus: dict[str, str], *, invalidates: bool) -> None:
         # coverage_floor=0 isolates the variable under test to invalidation alone.
+        # read_path="unit" pinned explicitly (v0.7 flips the resolved default to pool
+        # under semantic embedders): the harness measures the unit-path invalidation
+        # baseline and must stay warning-free under its lexical HashingEmbedder.
         self._cache = SemanticCache(
-            CorpusRetriever(corpus), StubSynthesizer(), embedder=HashingEmbedder(), coverage_floor=0.0
+            CorpusRetriever(corpus), StubSynthesizer(), embedder=HashingEmbedder(),
+            coverage_floor=0.0, read_path="unit",
         )
         self._invalidates = invalidates
 

@@ -151,7 +151,7 @@ def test_decompose_constructor_contract() -> None:
     # armed on the unit path the knob would be structurally inert — fail LOUD
     with pytest.raises(ValueError, match="decompose requires read_path='pool'"):
         SemanticCache(ret, synth, embedder=FunctionEmbedder(_embed),  # type: ignore[arg-type]
-                      decompose=lambda q: [])
+                      decompose=lambda q: [], read_path="unit")
     # the valid arming shapes construct fine
     _pool(ret, synth, decompose=lambda q: [])
     _pool(ret, synth, decompose=False)

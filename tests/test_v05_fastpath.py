@@ -45,7 +45,7 @@ def _mk(route_by_claim: bool) -> SemanticCache:
     retriever = InMemoryRetriever()
     cache = SemanticCache(retriever, _Synth(), embedder=FunctionEmbedder(_embed),
                           hit_threshold=0.95, coverage_floor=0.0,
-                          route_by_claim=route_by_claim)
+                          route_by_claim=route_by_claim, read_path="unit")
     topics = ["alpha rates", "beta limits", "gamma policy", "delta pricing",
               "epsilon terms", "zeta quota"]
     for t in topics:

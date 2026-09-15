@@ -50,6 +50,7 @@ def _world(**kw: object) -> tuple[SemanticCache, str, str]:
         _AtomSynth(),
         embedder=FunctionEmbedder(_embed),
         hit_threshold=0.35,
+        read_path="unit",
         coverage_floor=0.40,
         **kw,  # type: ignore[arg-type]
     )
@@ -103,7 +104,7 @@ def test_recall_dedups_repeated_claim_text() -> None:
     retriever.add("d1", "alice france bridge")               # one claim; summary == it
     cache = SemanticCache(
         retriever, _AtomSynth(), embedder=FunctionEmbedder(_embed),
-        hit_threshold=0.35, cross_unit_recall=True,
+        hit_threshold=0.35, cross_unit_recall=True, read_path="unit",
     )
     cache.get("alice france bridge")
     recalled = cache._recall_claims(_qe("alice france"), "", limit=10)
@@ -166,7 +167,7 @@ def _flow_cache(**kw: object) -> SemanticCache:
     retriever.add("geo", "france capital paris; germany capital berlin")
     cache = SemanticCache(
         retriever, _AtomSynth(), embedder=FunctionEmbedder(_embed),
-        hit_threshold=0.35, **kw,  # type: ignore[arg-type]
+        hit_threshold=0.35, read_path="unit", **kw,  # type: ignore[arg-type]
     )
     cache.get("alice bob")              # builds the PEOPLE unit (seed = 'alice bob')
     cache.get("capital paris berlin")   # builds the GEO unit

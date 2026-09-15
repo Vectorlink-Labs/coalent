@@ -60,6 +60,7 @@ def _world(**kw: object) -> tuple[SemanticCache, dict[str, str]]:
         hit_threshold=0.30,
         coverage_floor=0.35,
         recall_limit=2,
+        read_path="unit",
         **kw,  # type: ignore[arg-type]
     )
     ids: dict[str, str] = {}

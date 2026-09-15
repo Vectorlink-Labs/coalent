@@ -172,7 +172,7 @@ def test_upstream_params_fail_loud_off_pool_and_on_bad_types() -> None:
     ret.set("src:a", "alpha value gamma.")
     unit_cache = SemanticCache(ret, _ClaimSynth(["alpha value"]),     # type: ignore[arg-type]
                                embedder=FunctionEmbedder(_embed),
-                               hit_threshold=0.5, coverage_floor=0.0)
+                               hit_threshold=0.5, coverage_floor=0.0, read_path="unit")
     # structurally inert on the unit path -> fail LOUD (query_keys/decompose precedent)
     with pytest.raises(ValueError, match="require read_path='pool'"):
         unit_cache.get("alpha value", subs=["beta"])

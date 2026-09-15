@@ -241,7 +241,8 @@ def test_pool_epoch_bumps_on_in_place_rebuild() -> None:
     ret = _MutableRetriever()
     ret.set("src:a", "alpha stale value")
     cache = SemanticCache(ret, _Synth(), embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.3, coverage_floor=0.0, serve="pool")
+                          hit_threshold=0.3, coverage_floor=0.0, serve="pool",
+                          read_path="unit")
 
     r0 = cache.get("alpha")
     assert r0.cache_hit is False
@@ -273,7 +274,8 @@ def test_pool_epoch_monotone_no_cancellation() -> None:
     ret.add("src:a", "alpha value")
     ret.add("src:b", "beta value")
     cache = SemanticCache(ret, _Synth(), embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.99, coverage_floor=0.0, serve="pool")
+                          hit_threshold=0.99, coverage_floor=0.0, serve="pool",
+                          read_path="unit")
 
     cache.get("alpha")
     e_a = cache._rows_epoch
@@ -303,7 +305,8 @@ def test_usage_summed_multi_build() -> None:
     ret.add("src:two", "mix beta two")
     cache = SemanticCache(ret, _UsageSynth(prompt=10, completion=5),
                           embedder=FunctionEmbedder(_embed),
-                          hit_threshold=0.99, coverage_floor=0.0, split_by_artifact=True)
+                          hit_threshold=0.99, coverage_floor=0.0, split_by_artifact=True,
+                          read_path="unit")
 
     r = cache.get("common mix")
     assert r.cache_hit is False
@@ -1136,10 +1139,10 @@ def test_pool_without_header_warns_once_at_construction() -> None:
     with _w.catch_warnings():                       # header callable -> no warning
         _w.simplefilter("error")
         _pool(InMemoryRetriever(), pool_header=lambda u: "[hdr]")
-    with _w.catch_warnings():                       # unit path (default) -> no warning
+    with _w.catch_warnings():                       # explicit unit path -> no warning
         _w.simplefilter("error")
         SemanticCache(InMemoryRetriever(), _EchoSynth(),  # type: ignore[arg-type]
-                      embedder=FunctionEmbedder(_embed))
+                      embedder=FunctionEmbedder(_embed), read_path="unit")
 
 
 def test_pool_payload_always_attributed() -> None:
@@ -1371,30 +1374,45 @@ def test_stats_pool_extensions() -> None:
                  "pool_scan_slow"}
     assert pool_keys <= set(_pool().stats())
     unit_cache = SemanticCache(InMemoryRetriever(), _EchoSynth(),   # type: ignore[arg-type]
-                               embedder=FunctionEmbedder(_embed))
+                               embedder=FunctionEmbedder(_embed), read_path="unit")
     assert not (pool_keys & set(unit_cache.stats()))                # unit stats unchanged
 
 
 # ----------------------------------------------------------------------- v0.5 bit-identity
 
 def test_unit_mode_bit_identical() -> None:
-    def mk(**kw: object) -> SemanticCache:
+    """v0.7 BREAKING flip: the bare default no longer pins "unit" — the ESCAPE HATCH does.
+
+    Explicit ``read_path="unit"`` is the byte-identical pre-flip unit path, and under the
+    lexical ``HashingEmbedder`` the ``read_path=None`` sentinel resolves onto exactly that
+    same unit path (the loud fallback warning itself is pinned in
+    test_v07_default_read_path.py)."""
+    def mk(embedder: object, **kw: object) -> SemanticCache:
         ret = InMemoryRetriever()
         ret.add("src:a", "alpha value one")
         ret.add("src:b", "beta value two")
-        return SemanticCache(ret, _Synth(), embedder=FunctionEmbedder(_embed),
+        return SemanticCache(ret, _Synth(), embedder=embedder,       # type: ignore[arg-type]
                              hit_threshold=0.6, coverage_floor=0.3,
                              clock=lambda: 1000.0, **kw)   # type: ignore[arg-type]
 
-    default = mk()
-    explicit = mk(read_path="unit")
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")            # the loud fallback warning, pinned elsewhere
+        resolved = mk(HashingEmbedder())     # sentinel default -> resolves to "unit"
+    explicit = mk(HashingEmbedder(), read_path="unit")
     for q in ("alpha value one", "alpha one", "beta value two", "gamma", "alpha value one"):
-        assert default.get(q) == explicit.get(q)
-    default.source_changed("src:a", text="alpha revised")
+        assert resolved.get(q) == explicit.get(q)
+    resolved.source_changed("src:a", text="alpha revised")
     explicit.source_changed("src:a", text="alpha revised")
-    assert default.get("alpha value one") == explicit.get("alpha value one")
-    assert default.stats() == explicit.stats()
-    # Pool machinery is UNREACHABLE on the default path: nothing hydrated, nothing counted.
-    assert default._claim_indexes == {}
-    assert default._pool_hydrated == set()
-    assert default._pool_serves == 0 and default._probe_reads == 0
+    assert resolved.get("alpha value one") == explicit.get("alpha value one")
+    assert resolved.stats() == explicit.stats()
+
+    # Explicit unit under a SEMANTIC embedder: still the v0.5 unit machinery — pool
+    # machinery is UNREACHABLE (nothing hydrated, nothing counted), stats carry no pool keys.
+    unit = mk(FunctionEmbedder(_embed), read_path="unit")
+    for q in ("alpha value one", "alpha one", "beta value two", "gamma", "alpha value one"):
+        unit.get(q)
+    assert unit._claim_indexes == {}
+    assert unit._pool_hydrated == set()
+    assert unit._pool_serves == 0 and unit._probe_reads == 0
+    assert "pool_serves" not in unit.stats()
