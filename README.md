@@ -568,28 +568,8 @@ k9 0.71 @ 1311, n=605 held-out).
   decaying (−0.03) to compounding (+0.04).
 - Misattribution 2–6%; cross-unit recall fired on ~90% of reads (fully instrumented).
 
-### Structured regime (synthetic templates, v0.4)
-
-Measured honestly on the structured / reuse workload Coalent is built for — **64 sources × 3 seeds = 192 reads per condition**, real OpenAI embeddings, a **deterministic** number-and-attribute accuracy check (no LLM-judge self-preference), and a **real dense top-5 retriever shared by both arms** (the naive RAG baseline *is* that retriever). Accuracy is graded escalation-off, so a fallback can't launder a win.
-
-**Same accuracy as naive RAG, at a fraction of the context tokens** — across four answer models (95% CIs overlap on every model):
-
-| Answer model | Naive RAG | Coalent v0.4 |
-|---|:---:|:---:|
-| gpt-4o-mini  | 0.81 | 0.81 |
-| gpt-4.1-mini | 0.90 | 0.85 |
-| gpt-4o       | 0.90 | 0.87 |
-| gpt-4.1      | 0.99 | 0.97 |
-| **Context tokens / read** | **126** | **47** |
-
-And on the metrics that decide whether a cache is *trustworthy*, not just cheap:
-
-- 🎯 **Routing — `route@1 ≈ 1.00`.** The cache picks the correct source unit essentially every time.
-- 🛡️ **Misattribution — `~0–2%`.** How often it serves a number from the *wrong* source — the same noise floor as naive RAG's own answerer. (An earlier "27%" traced back to a benchmark bug — contradictory duplicate sources no router can resolve; found, fixed, documented. See the [transparency note](https://coalent.ai/docs/benchmark).)
-- 🔗 **Multi-hop — naive `0%` → Coalent `100%`.** On bridge questions whose second-hop evidence doesn't resemble the question, single-shot retrieval answers **0%**; cross-unit recall answers **100%**, at **zero extra LLM calls**.
-- 💰 **Economics — build once, reuse cheaply.** Understanding costs ~430 tokens / ~4s to build per source (once), then every later read is a warm cosine hit at ~⅓ the context. **Break-even ≈ 4–5 reads per source** — cheaper forever after.
-
-*Full per-model and per-knob breakdown, methodology, and the benchmark-transparency note (what we found, fixed, and how) in the [docs](https://coalent.ai/docs/benchmark).*
+*Older benchmark history — the v0.4 structured-regime study and the benchmark-transparency
+note (what we found, fixed, and how) — lives in the [docs](https://coalent.ai/docs/benchmark).*
 
 ## CLI
 
