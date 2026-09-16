@@ -47,9 +47,17 @@ Every context layer is forced to trade off three things. Coalent is built to hol
 
 Coalent sits **above retrieval** — bring any retriever (vector DB, hybrid search, GraphRAG, tools, APIs). It's the freshness-and-reuse layer, not another retriever — deliberately the *opposite* of GraphRAG's build-the-whole-graph-upfront tax: **lightweight, independent units, built lazily only when a query actually needs one**, and refreshed by dirtying a single unit (no graph surgery).
 
-> **New in v0.6** — the **pool read path** (`read_path="pool"`): every read serves the token-budgeted, globally ranked fresh-claim pool. Measured on a 605-question news benchmark (strict grading): **0.731 accuracy @ 981 context tokens** — matching naive top-9 (0.711 @ 1,311) at **~25% fewer tokens**, and naive's best measured point (top-12: 0.731 @ 1,729) at **~43% fewer**. Plus a default-OFF **behavioral stack** — residual spans → refusal fallback → append-only repair → query keys — measured at **−33% refusals** and **+3.1 pts** on the same store. All opt-in in 0.6 — and since **v0.7 the pool path is the default**: under a semantic embedder the read path resolves to `"pool"` automatically (`read_path="unit"` stays the byte-identical escape hatch). See [What's new in v0.7](#whats-new-in-v07).
+> **New in v0.7** — the **self-healing release**. The failure chain: when a read fails,
+> your agent calls `repair(read_id)` and the cache re-extracts what its build missed —
+> **permanently**. Measured on the same frozen 605-question rig: **0.826 vs 0.774** for
+> the strongest v0.6 configuration, **+5.3 points at an identical ~983-token serving
+> budget**, final refusals **−69%**. And the **default read path flips to pool**: under a
+> semantic embedder the read path resolves to `"pool"` automatically (`read_path="unit"`
+> stays the byte-identical escape hatch). See [What's new in v0.7](#whats-new-in-v07).
 >
 > **New in v0.6.1** — the **MCP server**: `coalent-mcp` puts the cache one line away from Claude Code, Cursor, or any MCP client ([Use it from Claude Code / Cursor](#use-it-from-claude-code--cursor-mcp)), and **[`langchain-coalent`](#langchain)** makes your existing LangChain stack the cache's substrate. Both additive-only.
+>
+> **v0.6** — the **pool read path** (`read_path="pool"`): every read serves the token-budgeted, globally ranked fresh-claim pool. Measured on the same benchmark: **0.731 accuracy @ 981 context tokens** — naive's best measured accuracy (top-12: 0.731 @ 1,729) at **~43% fewer tokens**. Plus the default-OFF **behavioral stack**, measured at **−33% refusals** and **+3.1 pts** on the same store.
 
 ## Install
 
@@ -492,6 +500,27 @@ For the full standalone MCP server (freshness loop, seven tools, HTTP transport)
 [langchain-coalent](#langchain).
 
 ## Benchmark
+
+### Real-world: the v0.7 failure chain (n=605)
+
+<!-- SANCTIONED 2026-09-15: every number in this subsection -->
+The same frozen rig as every anchor below (609 real news articles, 605 held-out
+questions, gpt-4.1-mini answerer, strict grading + locked adjudication rules), measuring
+the full v0.7 composition against **our own strongest v0.6 configuration — not naive**:
+
+| Arm | Accuracy | Context tokens | Final refusals |
+|---|:---:|:---:|:---:|
+| strongest v0.6 configuration (metadata header + behavioral stack) | 0.774 | ~983 | 61 |
+| **v0.7 composition (subs + gap detector + constraints → the failure chain)** | **0.826** | **~983** | **19 (−69%)** |
+
+- **+5.3 points at an identical serving budget** — zero extra serving tokens; the chain
+  adds cost only on reads that failed (gating repair on failure matches always-on
+  accuracy at **14% of the extraction calls**).
+- **Where the 57 fixes came from:** 37 first-pass (decomposition + metadata serving),
+  10 `repair()`, 6 `serve_unserved()`, 4 `reprobe()` — every rung earned its place.
+- Each rung fires **only on a failed read** — a refusal is never a correct answer, so
+  the downstream rungs have nothing to break. Repairs are **permanent**: the claims join
+  the store with per-claim provenance, and every future read of every user benefits.
 
 ### Real-world: the pool read path (v0.6, n=605)
 

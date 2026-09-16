@@ -82,7 +82,7 @@ from .events import (
     verify_github_signature,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.7.0.post1"
 
 __all__ = [
     "__version__",
