@@ -22,7 +22,7 @@
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
-  <a href="#whats-new-in-v06">What's new in v0.6</a> ·
+  <a href="#whats-new-in-v07">What's new in v0.7</a> ·
   <a href="#the-read-path--a-ladder-of-gates">Gate ladder</a> ·
   <a href="#bring-your-own-stack">Bring your own stack</a> ·
   <a href="#use-it-from-claude-code--cursor-mcp">MCP</a> ·
